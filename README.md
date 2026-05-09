@@ -15,6 +15,12 @@ npm install
 npm run dev
 ```
 
+frontend env:
+
+```bash
+cp .env.example .env
+```
+
 backend:
 
 ```bash
@@ -29,6 +35,7 @@ uvicorn main:app --reload
 
 1. audio upload (mp3/flac) with drag/drop
 2. local preview + basic metadata fields
+3. beat detection + bpm calculation via librosa endpoint (`POST /analyze/bpm`)
 
-next: beat detection + bpm calculation
+next: timing point generation (osu lazer format)
 

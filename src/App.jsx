@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const MB = 1024 * 1024;
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
 const emptyMetadata = {
   title: "",
@@ -40,6 +41,9 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState("");
   const [durationSec, setDurationSec] = useState(0);
   const [metadata, setMetadata] = useState(emptyMetadata);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [analysis, setAnalysis] = useState(null);
 
   useEffect(() => {
     return () => {
@@ -72,6 +76,8 @@ export default function App() {
     setAudioFile(file);
     setAudioUrl(nextUrl);
     setDurationSec(0);
+    setAnalysis(null);
+    setAnalysisError("");
     setMetadata((current) => ({
       ...current,
       title: nameMeta.title || current.title,
@@ -93,6 +99,35 @@ export default function App() {
 
   const setField = (field, value) => {
     setMetadata((current) => ({ ...current, [field]: value }));
+  };
+
+  const analyzeBpm = async () => {
+    if (!audioFile) return;
+    setIsAnalyzing(true);
+    setAnalysisError("");
+
+    const formData = new FormData();
+    formData.append("audio", audioFile);
+
+    try {
+      const response = await fetch(`${API_BASE}/analyze/bpm`, {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        throw new Error(errorPayload?.detail || "analysis request failed");
+      }
+
+      const payload = await response.json();
+      setAnalysis(payload);
+    } catch (error) {
+      setAnalysisError(error.message || "analysis failed");
+      setAnalysis(null);
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   return (
@@ -150,6 +185,23 @@ export default function App() {
               className="mt-4 w-full"
               onLoadedMetadata={(event) => setDurationSec(event.currentTarget.duration)}
             />
+            <button
+              type="button"
+              onClick={analyzeBpm}
+              disabled={isAnalyzing}
+              className="mt-4 rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isAnalyzing ? "analyzing..." : "analyze bpm"}
+            </button>
+            {analysisError && <p className="mt-2 text-sm text-rose-300">{analysisError}</p>}
+            {analysis && (
+              <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200">
+                <p>bpm: {analysis.bpm}</p>
+                <p>detected beats: {analysis.beat_count}</p>
+                <p>first beat at: {analysis.beats[0] ?? "n/a"} sec</p>
+                <p>beat length: {analysis.bpm > 0 ? (60000 / analysis.bpm).toFixed(2) : "n/a"} ms</p>
+              </div>
+            )}
           </article>
 
           <article className="rounded-2xl bg-slate-900 p-6">

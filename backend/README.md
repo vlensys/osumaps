@@ -11,3 +11,8 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
+## endpoints
+
+- `GET /health`
+- `POST /analyze/bpm` with multipart form field `audio` (`.mp3` or `.flac`)
+
