@@ -78,6 +78,7 @@ class HitObjectResponse(BaseModel):
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
@@ -304,6 +305,7 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
 
 
 @app.post("/analyze/bpm", response_model=BpmAnalysisResponse)
+@app.post("/api/analyze/bpm", response_model=BpmAnalysisResponse)
 async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
     suffix = Path(audio.filename or "track.mp3").suffix.lower()
     if suffix not in {".mp3", ".flac"}:
@@ -354,12 +356,14 @@ async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
 
 
 @app.post("/generate/timing-points", response_model=TimingPointResponse)
+@app.post("/api/generate/timing-points", response_model=TimingPointResponse)
 def generate_timing_points(payload: TimingPointRequest) -> TimingPointResponse:
     points = _generate_uninherited_points(payload)
     return TimingPointResponse(timing_points=points)
 
 
 @app.post("/generate/hit-objects", response_model=HitObjectResponse)
+@app.post("/api/generate/hit-objects", response_model=HitObjectResponse)
 def generate_hit_objects(payload: HitObjectRequest) -> HitObjectResponse:
     hit_objects = _generate_hit_objects(payload)
     return HitObjectResponse(hit_objects=hit_objects)
