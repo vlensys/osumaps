@@ -362,8 +362,9 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
     spectral_flux = librosa.onset.onset_strength(y=y, sr=sr)
     rms = librosa.feature.rms(y=y)[0]
 
-    stft = np.abs(librosa.stft(y, n_fft=1024, hop_length=512))
-    freqs = librosa.fft_frequencies(sr=sr)
+    n_fft = 1024
+    stft = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     bass_mask = freqs < 250
     mid_mask = (freqs >= 250) & (freqs < 4000)
     high_mask = freqs >= 4000
