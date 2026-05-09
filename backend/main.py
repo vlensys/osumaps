@@ -330,7 +330,7 @@ def _generate_uninherited_points(payload: TimingPointRequest) -> list[TimingPoin
 
 
 def _analyze_audio_librosa(path: Path) -> dict[str, object]:
-    y, sr = librosa.load(path.as_posix(), sr=None, mono=True)
+    y, sr = librosa.load(path.as_posix(), sr=22050, mono=True, dtype=np.float32)
 
     onset_times = librosa.onset.onset_detect(
         y=y, sr=sr, units="time", delta=0.07, wait=10
@@ -338,7 +338,7 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
     spectral_flux = librosa.onset.onset_strength(y=y, sr=sr)
     rms = librosa.feature.rms(y=y)[0]
 
-    stft = np.abs(librosa.stft(y))
+    stft = np.abs(librosa.stft(y, n_fft=1024, hop_length=512))
     freqs = librosa.fft_frequencies(sr=sr)
     bass_mask = freqs < 250
     mid_mask = (freqs >= 250) & (freqs < 4000)
@@ -348,20 +348,27 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
     mid_energy = stft[mid_mask, :].mean(axis=0) if np.any(mid_mask) else np.zeros(stft.shape[1])
     high_energy = stft[high_mask, :].mean(axis=0) if np.any(high_mask) else np.zeros(stft.shape[1])
 
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    # Faster tempo/downbeat approximation for hosted free-tier CPU limits.
+    tempo_candidates = librosa.feature.tempo(
+        onset_envelope=spectral_flux, sr=sr, aggregate=np.median
+    )
+    tempo_value = float(tempo_candidates[0]) if len(tempo_candidates) else 120.0
+    tempo_value = max(1.0, tempo_value)
+    beat_period = 60.0 / tempo_value
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    beat_start = float(onset_times[0]) if len(onset_times) else 0.0
+    beat_times = np.arange(beat_start, max(duration, beat_start + beat_period), beat_period)
 
     centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
     beat_strengths: list[float] = []
     beat_centroids: list[float] = []
+    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
     for frame in beat_frames:
         frame_index = int(frame)
         strength = float(spectral_flux[frame_index]) if frame_index < len(spectral_flux) else 0.0
         centroid = float(centroids[frame_index]) if frame_index < len(centroids) else 0.0
         beat_strengths.append(strength)
         beat_centroids.append(centroid)
-
-    tempo_value = float(tempo[0] if hasattr(tempo, "__len__") else tempo)
 
     return {
         "y_len": len(y),
@@ -372,9 +379,9 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
         "bass_energy": bass_energy,
         "mid_energy": mid_energy,
         "high_energy": high_energy,
-        "tempo": max(1.0, tempo_value),
+        "tempo": tempo_value,
         "beat_times": beat_times,
-        "duration": float(librosa.get_duration(y=y, sr=sr)),
+        "duration": duration,
         "beat_strengths": beat_strengths,
         "beat_centroids": beat_centroids,
     }
