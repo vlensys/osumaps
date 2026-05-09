@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const MB = 1024 * 1024;
+const APP_MAX_FILE_BYTES = 100 * MB;
 const API_BASE =
   import.meta.env.VITE_API_BASE ||
   (typeof window !== "undefined" &&
@@ -81,6 +82,10 @@ function difficultyFromStars(star) {
   if (star < 4) return "Hard";
   if (star < 5.5) return "Insane";
   return "Expert";
+}
+
+function isVercelApi(base) {
+  return typeof base === "string" && base.includes("vercel.app");
 }
 
 const CRC_TABLE = (() => {
@@ -397,6 +402,10 @@ export default function App() {
       alert("only mp3 and flac are supported");
       return;
     }
+    if (file.size > APP_MAX_FILE_BYTES) {
+      alert("file too large. maximum supported size is 100 mb");
+      return;
+    }
 
     const nameMeta = parseName(file.name);
     let tagMeta = null;
@@ -535,10 +544,20 @@ export default function App() {
     formData.append("volume", String(mapSettings.timingVolume));
     formData.append("effects", String(mapSettings.effects));
 
-    const response = await fetch(`${API_BASE}/generate/full-map`, {
-      method: "POST",
-      body: formData
-    });
+    let response;
+    try {
+      response = await fetch(`${API_BASE}/generate/full-map`, {
+        method: "POST",
+        body: formData
+      });
+    } catch (error) {
+      if (isVercelApi(API_BASE) && audioFile.size > 4.5 * MB) {
+        throw new Error(
+          "hosted backend rejected upload (vercel request limit). your app limit is 100 mb, but this host cannot process this file size."
+        );
+      }
+      throw error;
+    }
     if (!response.ok) {
       const errorPayload = await response.json().catch(() => null);
       const detail = errorPayload?.detail || "full pipeline request failed";
