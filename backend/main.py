@@ -10,7 +10,7 @@ from statistics import median
 
 import librosa
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -217,6 +217,17 @@ def health() -> dict[str, str]:
 @app.get("/")
 def root() -> dict[str, str]:
     return {"status": "ok", "service": "osumaps backend"}
+
+
+@app.head("/")
+def root_head() -> Response:
+    return Response(status_code=200)
+
+
+@app.head("/health")
+@app.head("/api/health")
+def health_head() -> Response:
+    return Response(status_code=200)
 
 
 def _format_timing_line(
