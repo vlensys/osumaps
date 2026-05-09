@@ -57,6 +57,7 @@ backend (vercel fallback):
 6. `.osu` export from generated metadata + timing + hit objects
 7. playback sync verifier against generated hit object times
 8. in-app beatmap sanity check for common spec errors before lazer import
+9. one-click full pipeline button (analyze -> timing -> notes -> sanity check)
 
 ## remaining before ship
 
@@ -66,4 +67,5 @@ backend (vercel fallback):
 4. resolve local git index lock/permission issue before normal commits
 
 qa checklist: `docs/qa-checklist.md`
+api qa runner: `npm run qa:api -- <mp3-file> <flac-file>`
 

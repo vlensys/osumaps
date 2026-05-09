@@ -13,6 +13,16 @@ const emptyMetadata = {
   tags: ""
 };
 
+const defaultMapSettings = {
+  meter: 4,
+  sampleSet: 1,
+  sampleIndex: 0,
+  timingVolume: 70,
+  effects: 0,
+  maxNotes: 500,
+  noteDensity: 0.78
+};
+
 function parseName(name) {
   const withoutExtension = name.replace(/\.[^/.]+$/, "");
   const split = withoutExtension.split(" - ");
@@ -160,6 +170,7 @@ export default function App() {
   const [playbackSec, setPlaybackSec] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [metadata, setMetadata] = useState(emptyMetadata);
+  const [mapSettings, setMapSettings] = useState(defaultMapSettings);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState("");
   const [analysis, setAnalysis] = useState(null);
@@ -172,6 +183,7 @@ export default function App() {
   const [exportError, setExportError] = useState("");
   const [validationResult, setValidationResult] = useState(null);
   const [metadataSource, setMetadataSource] = useState("filename");
+  const [isRunningPipeline, setIsRunningPipeline] = useState(false);
 
   useEffect(() => {
     return () => {
@@ -257,6 +269,7 @@ export default function App() {
       source: tagMeta?.source || current.source,
       tags: tagMeta?.tags || current.tags
     }));
+    setMapSettings(defaultMapSettings);
     setMetadataSource(tagMeta?.title || tagMeta?.artist ? "audio tags" : "filename");
   };
 
@@ -274,6 +287,10 @@ export default function App() {
 
   const setField = (field, value) => {
     setMetadata((current) => ({ ...current, [field]: value }));
+  };
+
+  const setSetting = (field, value) => {
+    setMapSettings((current) => ({ ...current, [field]: value }));
   };
 
   const analyzeBpm = async () => {
@@ -300,18 +317,20 @@ export default function App() {
       setNotesError("");
       setHitObjects([]);
       setValidationResult(null);
+      return payload;
     } catch (error) {
       setAnalysisError(error.message || "analysis failed");
       setAnalysis(null);
       setTimingPoints([]);
       setHitObjects([]);
+      return null;
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const generateTimingPoints = async () => {
-    if (!analysis) return;
+  const generateTimingPoints = async (analysisPayload = analysis) => {
+    if (!analysisPayload) return null;
     setIsGeneratingTiming(true);
     setTimingError("");
 
@@ -320,13 +339,13 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          bpm: analysis.bpm,
-          beats: analysis.beats,
-          meter: 4,
-          sample_set: 1,
-          sample_index: 0,
-          volume: 70,
-          effects: 0
+          bpm: analysisPayload.bpm,
+          beats: analysisPayload.beats,
+          meter: mapSettings.meter,
+          sample_set: mapSettings.sampleSet,
+          sample_index: mapSettings.sampleIndex,
+          volume: mapSettings.timingVolume,
+          effects: mapSettings.effects
         })
       });
 
@@ -340,16 +359,18 @@ export default function App() {
       setNotesError("");
       setHitObjects([]);
       setValidationResult(null);
+      return payload.timing_points ?? [];
     } catch (error) {
       setTimingError(error.message || "timing point generation failed");
       setTimingPoints([]);
+      return null;
     } finally {
       setIsGeneratingTiming(false);
     }
   };
 
-  const generateHitObjects = async () => {
-    if (!analysis) return;
+  const generateHitObjects = async (analysisPayload = analysis) => {
+    if (!analysisPayload) return null;
     setIsGeneratingNotes(true);
     setNotesError("");
 
@@ -358,11 +379,11 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          beats: analysis.beats,
-          beat_strengths: analysis.beat_strengths ?? [],
-          beat_centroids: analysis.beat_centroids ?? [],
-          max_notes: 500,
-          density: 0.78
+          beats: analysisPayload.beats,
+          beat_strengths: analysisPayload.beat_strengths ?? [],
+          beat_centroids: analysisPayload.beat_centroids ?? [],
+          max_notes: mapSettings.maxNotes,
+          density: mapSettings.noteDensity
         })
       });
 
@@ -375,12 +396,49 @@ export default function App() {
       setHitObjects(payload.hit_objects ?? []);
       setExportError("");
       setValidationResult(null);
+      return payload.hit_objects ?? [];
     } catch (error) {
       setNotesError(error.message || "hit object generation failed");
       setHitObjects([]);
+      return null;
     } finally {
       setIsGeneratingNotes(false);
     }
+  };
+
+  const runFullPipeline = async () => {
+    if (!audioFile) return;
+    setIsRunningPipeline(true);
+    setAnalysisError("");
+    setTimingError("");
+    setNotesError("");
+    setExportError("");
+
+    const analysisPayload = await analyzeBpm();
+    if (!analysisPayload) {
+      setIsRunningPipeline(false);
+      return;
+    }
+
+    const generatedTiming = await generateTimingPoints(analysisPayload);
+    if (!generatedTiming || generatedTiming.length === 0) {
+      setIsRunningPipeline(false);
+      return;
+    }
+
+    const generatedNotes = await generateHitObjects(analysisPayload);
+    if (!generatedNotes || generatedNotes.length === 0) {
+      setIsRunningPipeline(false);
+      return;
+    }
+
+    const result = validateBeatmapDraft({
+      metadata,
+      timingPoints: generatedTiming,
+      hitObjects: generatedNotes
+    });
+    setValidationResult(result);
+    setIsRunningPipeline(false);
   };
 
   const exportOsuFile = () => {
@@ -490,10 +548,18 @@ export default function App() {
             <button
               type="button"
               onClick={analyzeBpm}
-              disabled={isAnalyzing}
+              disabled={isAnalyzing || isRunningPipeline}
               className="mt-4 rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {isAnalyzing ? "analyzing..." : "analyze bpm"}
+            </button>
+            <button
+              type="button"
+              onClick={runFullPipeline}
+              disabled={isRunningPipeline}
+              className="mt-3 rounded-lg bg-indigo-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-indigo-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isRunningPipeline ? "running full pipeline..." : "run full pipeline"}
             </button>
             {analysisError && <p className="mt-2 text-sm text-rose-300">{analysisError}</p>}
             {analysis && (
@@ -607,6 +673,87 @@ export default function App() {
                   />
                 </label>
               ))}
+            </div>
+
+            <h3 className="mt-6 text-lg font-semibold text-slate-100">generation settings</h3>
+            <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-300">
+              <label>
+                <span className="mb-1 block">meter</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="12"
+                  value={mapSettings.meter}
+                  onChange={(event) => setSetting("meter", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">timing volume</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={mapSettings.timingVolume}
+                  onChange={(event) => setSetting("timingVolume", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">sample set (0-3)</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="3"
+                  value={mapSettings.sampleSet}
+                  onChange={(event) => setSetting("sampleSet", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">sample index</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={mapSettings.sampleIndex}
+                  onChange={(event) => setSetting("sampleIndex", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">effects</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  value={mapSettings.effects}
+                  onChange={(event) => setSetting("effects", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">max notes</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="2000"
+                  value={mapSettings.maxNotes}
+                  onChange={(event) => setSetting("maxNotes", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
+              <label>
+                <span className="mb-1 block">note density (0.1-1.0)</span>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.1"
+                  max="1"
+                  value={mapSettings.noteDensity}
+                  onChange={(event) => setSetting("noteDensity", Number(event.target.value))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                />
+              </label>
             </div>
           </article>
         </section>

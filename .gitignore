@@ -32,3 +32,7 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
+# local qa artifacts
+tmp_test_audio/
+tmp_output/
+
