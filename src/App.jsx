@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { parseBlob } from "music-metadata-browser";
 
 const MB = 1024 * 1024;
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
@@ -110,6 +111,45 @@ function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectL
   ].join("\n");
 }
 
+function validateBeatmapDraft({ metadata, timingPoints, hitObjects }) {
+  const issues = [];
+
+  if (!cleanField(metadata.title)) issues.push("metadata title is empty");
+  if (!cleanField(metadata.artist)) issues.push("metadata artist is empty");
+  if (!cleanField(metadata.creator)) issues.push("metadata creator is empty");
+  if (!cleanField(metadata.version)) issues.push("metadata version is empty");
+
+  if (timingPoints.length === 0) issues.push("no timing points generated");
+  if (hitObjects.length === 0) issues.push("no hit objects generated");
+
+  for (let i = 0; i < timingPoints.length; i += 1) {
+    const tp = timingPoints[i];
+    if (!(tp.beat_length > 0)) issues.push(`timing point ${i + 1} has invalid beat_length`);
+    if (tp.time < 0) issues.push(`timing point ${i + 1} has negative time`);
+  }
+
+  for (let i = 0; i < hitObjects.length; i += 1) {
+    const obj = hitObjects[i];
+    if (obj.x < 0 || obj.x > 512) issues.push(`hit object ${i + 1} has x out of range`);
+    if (obj.y < 0 || obj.y > 384) issues.push(`hit object ${i + 1} has y out of range`);
+    if (obj.time < 0) issues.push(`hit object ${i + 1} has negative time`);
+    if (i > 0 && obj.time < hitObjects[i - 1].time) {
+      issues.push(`hit object ${i + 1} is out of time order`);
+    }
+  }
+
+  const firstHitTime = hitObjects.length > 0 ? hitObjects[0].time : null;
+  const firstTimingTime = timingPoints.length > 0 ? timingPoints[0].time : null;
+  if (firstHitTime !== null && firstTimingTime !== null && firstTimingTime > firstHitTime) {
+    issues.push("first timing point starts after first hit object");
+  }
+
+  return {
+    ok: issues.length === 0,
+    issues
+  };
+}
+
 export default function App() {
   const fileRef = useRef(null);
   const audioRef = useRef(null);
@@ -130,6 +170,8 @@ export default function App() {
   const [notesError, setNotesError] = useState("");
   const [hitObjects, setHitObjects] = useState([]);
   const [exportError, setExportError] = useState("");
+  const [validationResult, setValidationResult] = useState(null);
+  const [metadataSource, setMetadataSource] = useState("filename");
 
   useEffect(() => {
     return () => {
@@ -171,7 +213,7 @@ export default function App() {
     };
   }, [hitObjects, playbackSec]);
 
-  const updateFile = (file) => {
+  const updateFile = async (file) => {
     if (!file) return;
     const validExt = /\.(mp3|flac)$/i.test(file.name);
     if (!validExt) {
@@ -180,6 +222,18 @@ export default function App() {
     }
 
     const nameMeta = parseName(file.name);
+    let tagMeta = null;
+    try {
+      const parsed = await parseBlob(file);
+      tagMeta = {
+        title: cleanField(parsed.common?.title),
+        artist: cleanField(parsed.common?.artist),
+        source: cleanField(parsed.common?.album),
+        tags: cleanField(parsed.common?.genre?.join(" "))
+      };
+    } catch {
+      tagMeta = null;
+    }
     const nextUrl = URL.createObjectURL(file);
 
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -195,23 +249,27 @@ export default function App() {
     setNotesError("");
     setHitObjects([]);
     setExportError("");
+    setValidationResult(null);
     setMetadata((current) => ({
       ...current,
-      title: nameMeta.title || current.title,
-      artist: nameMeta.artist || current.artist
+      title: tagMeta?.title || nameMeta.title || current.title,
+      artist: tagMeta?.artist || nameMeta.artist || current.artist,
+      source: tagMeta?.source || current.source,
+      tags: tagMeta?.tags || current.tags
     }));
+    setMetadataSource(tagMeta?.title || tagMeta?.artist ? "audio tags" : "filename");
   };
 
-  const onInputChange = (event) => {
+  const onInputChange = async (event) => {
     const selected = event.target.files?.[0];
-    updateFile(selected);
+    await updateFile(selected);
   };
 
-  const onDrop = (event) => {
+  const onDrop = async (event) => {
     event.preventDefault();
     setDragActive(false);
     const dropped = event.dataTransfer.files?.[0];
-    updateFile(dropped);
+    await updateFile(dropped);
   };
 
   const setField = (field, value) => {
@@ -241,6 +299,7 @@ export default function App() {
       setAnalysis(payload);
       setNotesError("");
       setHitObjects([]);
+      setValidationResult(null);
     } catch (error) {
       setAnalysisError(error.message || "analysis failed");
       setAnalysis(null);
@@ -280,6 +339,7 @@ export default function App() {
       setTimingPoints(payload.timing_points ?? []);
       setNotesError("");
       setHitObjects([]);
+      setValidationResult(null);
     } catch (error) {
       setTimingError(error.message || "timing point generation failed");
       setTimingPoints([]);
@@ -314,6 +374,7 @@ export default function App() {
       const payload = await response.json();
       setHitObjects(payload.hit_objects ?? []);
       setExportError("");
+      setValidationResult(null);
     } catch (error) {
       setNotesError(error.message || "hit object generation failed");
       setHitObjects([]);
@@ -359,6 +420,11 @@ export default function App() {
     anchor.remove();
     URL.revokeObjectURL(url);
     setExportError("");
+  };
+
+  const runSanityValidation = () => {
+    const result = validateBeatmapDraft({ metadata, timingPoints, hitObjects });
+    setValidationResult(result);
   };
 
   return (
@@ -481,6 +547,29 @@ export default function App() {
               export .osu
             </button>
             {exportError && <p className="mt-2 text-sm text-rose-300">{exportError}</p>}
+            <button
+              type="button"
+              onClick={runSanityValidation}
+              className="mt-3 rounded-lg bg-lime-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-lime-200"
+            >
+              run beatmap sanity check
+            </button>
+            {validationResult && (
+              <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200">
+                <p className="font-semibold text-slate-100">
+                  sanity status: {validationResult.ok ? "pass" : "needs fixes"}
+                </p>
+                {validationResult.ok ? (
+                  <p className="mt-1 text-emerald-300">no issues found in draft structure</p>
+                ) : (
+                  <ul className="mt-2 list-disc pl-4 text-rose-300">
+                    {validationResult.issues.map((issue) => (
+                      <li key={issue}>{issue}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
             {hitObjects.length > 0 && (
               <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200">
                 <p className="font-semibold text-slate-100">playback sync check</p>
@@ -506,6 +595,7 @@ export default function App() {
 
           <article className="rounded-2xl bg-slate-900 p-6">
             <h2 className="text-xl font-semibold">map metadata</h2>
+            <p className="mt-2 text-xs text-slate-400">auto-filled from: {metadataSource}</p>
             <div className="mt-4 grid gap-3">
               {Object.entries(metadata).map(([key, value]) => (
                 <label key={key} className="text-sm text-slate-300">
