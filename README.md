@@ -24,6 +24,30 @@ audio to osu! lazer map converter.
 - `generate note pattern`: sends beat features to API and builds `[HitObjects]`.
 - `run beatmap sanity check`: validates common format mistakes.
 
+## generation settings explained
+
+- `meter`:
+  - beats per measure used in `[TimingPoints]`.
+  - common values: `4` (most songs), `3` (waltz feel).
+- `timing volume`:
+  - hit sound sample volume value written into timing points (`0-100`).
+  - affects perceived loudness of map hit samples.
+- `sample set (0-3)`:
+  - timing point sample set id.
+  - `1` is standard default for most maps.
+- `sample index`:
+  - custom sample bank index for timing samples.
+  - leave `0` unless you use custom sample sets.
+- `effects`:
+  - timing point effects flag.
+  - keep `0` for normal behavior.
+- `max notes`:
+  - hard cap on generated hit objects.
+  - lower = sparser/easier drafts, higher = denser drafts.
+- `note density (0.1-1.0)`:
+  - intensity threshold for how many beats become notes.
+  - lower values generate more notes; higher values generate fewer notes.
+
 ## troubleshooting
 
 - `networkerror` / `cors` on analyze:
