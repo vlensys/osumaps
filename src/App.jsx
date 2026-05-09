@@ -13,6 +13,7 @@ const emptyMetadata = {
 };
 
 const defaultMapSettings = {
+  starRating: 5.0,
   meter: 4,
   sampleSet: 1,
   sampleIndex: 0,
@@ -288,13 +289,19 @@ async function analyzeAudioClientSide(file) {
   }
 }
 
-function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectLines }) {
+function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectLines, mapSettings }) {
   const title = cleanField(metadata.title, "untitled");
   const artist = cleanField(metadata.artist, "unknown artist");
   const creator = cleanField(metadata.creator, "osumaps");
   const version = cleanField(metadata.version, "generated");
   const source = cleanField(metadata.source, "");
   const tags = cleanField(metadata.tags, "auto generated osumaps");
+  const star = Number.isFinite(mapSettings?.starRating) ? mapSettings.starRating : 5;
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const hp = clamp(2.5 + star * 0.65, 2, 9);
+  const cs = clamp(2.7 + star * 0.35, 2, 7);
+  const od = clamp(3 + star * 0.7, 2, 9.5);
+  const ar = clamp(4 + star * 0.6, 2, 10);
 
   return [
     "osu file format v128",
@@ -329,10 +336,10 @@ function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectL
     "BeatmapSetID:-1",
     "",
     "[Difficulty]",
-    "HPDrainRate:5",
-    "CircleSize:4",
-    "OverallDifficulty:7",
-    "ApproachRate:8",
+    `HPDrainRate:${hp.toFixed(1)}`,
+    `CircleSize:${cs.toFixed(1)}`,
+    `OverallDifficulty:${od.toFixed(1)}`,
+    `ApproachRate:${ar.toFixed(1)}`,
     "SliderMultiplier:1.4",
     "SliderTickRate:1",
     "",
@@ -624,7 +631,8 @@ export default function App() {
           beat_strengths: analysisPayload.beat_strengths ?? [],
           beat_centroids: analysisPayload.beat_centroids ?? [],
           max_notes: mapSettings.maxNotes,
-          density: mapSettings.noteDensity
+          density: mapSettings.noteDensity,
+          difficulty_star: mapSettings.starRating
         })
       });
 
@@ -703,7 +711,8 @@ export default function App() {
       metadata,
       audioFilename: audioFile.name,
       timingPointLines: timingPoints.map((point) => point.line),
-      hitObjectLines: hitObjects.map((obj) => obj.line)
+      hitObjectLines: hitObjects.map((obj) => obj.line),
+      mapSettings
     });
 
     const artistPart = sanitizeFilenamePart(metadata.artist, "unknown artist");
@@ -928,6 +937,18 @@ export default function App() {
 
             <h3 className="mt-6 text-lg font-semibold text-slate-100">generation settings</h3>
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-300">
+              <label className="col-span-2">
+                <span className="mb-1 block">difficulty stars ({mapSettings.starRating.toFixed(1)}★)</span>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  step="0.1"
+                  value={mapSettings.starRating}
+                  onChange={(event) => setSetting("starRating", Number(event.target.value))}
+                  className="w-full accent-cyan-300"
+                />
+              </label>
               <label>
                 <span className="mb-1 block">meter</span>
                 <input

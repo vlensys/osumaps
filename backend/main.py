@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+import math
 from statistics import median
 
 import librosa
@@ -71,6 +72,7 @@ class HitObjectRequest(BaseModel):
     beat_centroids: list[float] = []
     max_notes: int = 400
     density: float = 0.75
+    difficulty_star: float = 5.0
 
 
 class HitObjectResponse(BaseModel):
@@ -235,6 +237,7 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
 
     max_notes = min(max(payload.max_notes, 1), 2000)
     density = min(max(payload.density, 0.1), 1.0)
+    star = min(max(payload.difficulty_star, 0.5), 10.0)
 
     strength_values = payload.beat_strengths[: len(beats)] if payload.beat_strengths else [1.0] * len(beats)
     centroid_values = payload.beat_centroids[: len(beats)] if payload.beat_centroids else [0.0] * len(beats)
@@ -248,8 +251,30 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     quantile_index = int((1.0 - density) * (len(sorted_strengths) - 1))
     threshold = sorted_strengths[quantile_index] if sorted_strengths else 0.0
 
+    # osu! standard playfield is 512x384
+    cs = min(max(2.5 + star * 0.35, 2.0), 7.0)
+    radius = (54.4 - 4.48 * cs) * 1.00041
+    margin = int(max(radius + 8, 24))
+    min_x, max_x = margin, 512 - margin
+    min_y, max_y = margin, 384 - margin
+
+    base_min_jump = 16.0 + 4.5 * star
+    base_max_jump = 54.0 + 13.0 * star
+    min_note_distance = max(radius * 0.95, 20.0 + 1.5 * star)
+
+    intervals = []
+    for i in range(len(beats) - 1):
+        intervals.append(max(0.001, beats[i + 1] - beats[i]))
+    default_interval = sum(intervals) / len(intervals) if intervals else 0.5
+
     hit_objects: list[HitObject] = []
     last_time = -10_000
+    current_x = 256.0
+    current_y = 192.0
+    angle = 0.0
+
+    def clamp(value: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, value))
 
     for index, beat_sec in enumerate(beats):
         if len(hit_objects) >= max_notes:
@@ -265,9 +290,53 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
         if time_ms - last_time < 70:
             continue
 
-        x = int(round(64 + centroid * 384))
-        x = min(max(x, 0), 512)
-        y = 192
+        interval = intervals[index] if index < len(intervals) else default_interval
+        interval_ratio = clamp(interval / max(default_interval, 0.001), 0.5, 1.75)
+        interval_factor = (interval_ratio - 0.5) / (1.75 - 0.5)
+        # time-distance-equality base: shorter rhythms -> smaller spacing.
+        jump = base_min_jump + (base_max_jump - base_min_jump) * (0.65 * strength + 0.35 * interval_factor)
+
+        # Use centroid as directional change driver and strength as extra movement weight.
+        turn = (centroid - 0.5) * 1.9
+        if strength > 0.85:
+            turn += 0.35 if index % 2 == 0 else -0.35
+        angle += turn
+
+        candidate_x = current_x
+        candidate_y = current_y
+        found = False
+        for attempt in range(14):
+            step = jump * (1.0 + 0.05 * attempt)
+            px = current_x + step * math.cos(angle)
+            py = current_y + step * math.sin(angle)
+
+            if px < min_x or px > max_x:
+                angle = math.pi - angle
+                px = clamp(px, min_x, max_x)
+            if py < min_y or py > max_y:
+                angle = -angle
+                py = clamp(py, min_y, max_y)
+
+            if hit_objects:
+                prev = hit_objects[-1]
+                dx = px - prev.x
+                dy = py - prev.y
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist < min_note_distance:
+                    angle += 0.55
+                    continue
+
+            candidate_x, candidate_y = px, py
+            found = True
+            break
+
+        if not found:
+            candidate_x = clamp(current_x + jump, min_x, max_x)
+            candidate_y = clamp(current_y + jump * 0.2, min_y, max_y)
+
+        current_x, current_y = candidate_x, candidate_y
+        x = int(round(candidate_x))
+        y = int(round(candidate_y))
         object_type = 5 if len(hit_objects) % 4 == 0 else 1
         hit_sound = 4 if strength > 0.85 else 0
         hit_sample = "0:0:0:0:"
