@@ -365,28 +365,46 @@ def _generate_uninherited_points(payload: TimingPointRequest) -> list[TimingPoin
 
 
 def _analyze_audio_librosa(path: Path) -> dict[str, object]:
-    y, sr = librosa.load(path.as_posix(), sr=22050, mono=True, dtype=np.float32)
+    sr_target = 16000
+    hop_length = 512
+    n_fft = 1024
+
+    y, sr = librosa.load(path.as_posix(), sr=sr_target, mono=True, dtype=np.float32)
+    if y.size == 0:
+        raise ValueError("decoded audio has no samples")
 
     onset_times = librosa.onset.onset_detect(
-        y=y, sr=sr, units="time", delta=0.07, wait=10
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        units="time",
+        delta=0.07,
+        wait=10,
     )
-    spectral_flux = librosa.onset.onset_strength(y=y, sr=sr)
-    rms = librosa.feature.rms(y=y)[0]
+    spectral_flux = librosa.onset.onset_strength(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        n_fft=n_fft,
+    ).astype(np.float32, copy=False)
+    rms = librosa.feature.rms(
+        y=y,
+        frame_length=n_fft,
+        hop_length=hop_length,
+    )[0].astype(np.float32, copy=False)
 
-    n_fft = 1024
-    stft = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    bass_mask = freqs < 250
-    mid_mask = (freqs >= 250) & (freqs < 4000)
-    high_mask = freqs >= 4000
+    bass_energy, mid_energy, high_energy = _compute_band_energies(
+        y=y,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+    )
 
-    bass_energy = stft[bass_mask, :].mean(axis=0) if np.any(bass_mask) else np.zeros(stft.shape[1])
-    mid_energy = stft[mid_mask, :].mean(axis=0) if np.any(mid_mask) else np.zeros(stft.shape[1])
-    high_energy = stft[high_mask, :].mean(axis=0) if np.any(high_mask) else np.zeros(stft.shape[1])
-
-    # Faster tempo/downbeat approximation for hosted free-tier CPU limits.
     tempo_candidates = librosa.feature.tempo(
-        onset_envelope=spectral_flux, sr=sr, aggregate=np.median
+        onset_envelope=spectral_flux,
+        sr=sr,
+        hop_length=hop_length,
+        aggregate=np.median,
     )
     tempo_value = float(tempo_candidates[0]) if len(tempo_candidates) else 120.0
     tempo_value = max(1.0, tempo_value)
@@ -395,16 +413,25 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
     beat_start = float(onset_times[0]) if len(onset_times) else 0.0
     beat_times = np.arange(beat_start, max(duration, beat_start + beat_period), beat_period)
 
-    centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    frame_count = min(len(spectral_flux), len(rms), len(bass_energy), len(mid_energy), len(high_energy))
+    if frame_count == 0:
+        raise ValueError("audio feature extraction returned empty frames")
+    spectral_flux = spectral_flux[:frame_count]
+    rms = rms[:frame_count]
+    bass_energy = bass_energy[:frame_count]
+    mid_energy = mid_energy[:frame_count]
+    high_energy = high_energy[:frame_count]
+
     beat_strengths: list[float] = []
     beat_centroids: list[float] = []
-    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
+    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop_length)
     for frame in beat_frames:
-        frame_index = int(frame)
-        strength = float(spectral_flux[frame_index]) if frame_index < len(spectral_flux) else 0.0
-        centroid = float(centroids[frame_index]) if frame_index < len(centroids) else 0.0
+        frame_index = max(0, min(int(frame), frame_count - 1))
+        strength = float(spectral_flux[frame_index])
+        total_band = float(bass_energy[frame_index] + mid_energy[frame_index] + high_energy[frame_index]) + 1e-6
+        centroid_ratio = float(high_energy[frame_index] / total_band)
         beat_strengths.append(strength)
-        beat_centroids.append(centroid)
+        beat_centroids.append(centroid_ratio)
 
     return {
         "y_len": len(y),
@@ -421,6 +448,49 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
         "beat_strengths": beat_strengths,
         "beat_centroids": beat_centroids,
     }
+
+
+def _compute_band_energies(
+    y: np.ndarray,
+    sr: int,
+    n_fft: int,
+    hop_length: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if y.size == 0:
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty, empty
+
+    if y.size <= n_fft:
+        frame_count = 1
+    else:
+        frame_count = 1 + int(np.ceil((y.size - n_fft) / hop_length))
+    window = np.hanning(n_fft).astype(np.float32)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+
+    bass_mask = freqs < 250
+    mid_mask = (freqs >= 250) & (freqs < 4000)
+    high_mask = freqs >= 4000
+
+    bass_energy = np.zeros(frame_count, dtype=np.float32)
+    mid_energy = np.zeros(frame_count, dtype=np.float32)
+    high_energy = np.zeros(frame_count, dtype=np.float32)
+
+    frame = np.zeros(n_fft, dtype=np.float32)
+    for frame_idx in range(frame_count):
+        start = frame_idx * hop_length
+        end = min(start + n_fft, y.size)
+        frame.fill(0.0)
+        frame[: end - start] = y[start:end]
+        spectrum = np.abs(np.fft.rfft(frame * window)).astype(np.float32, copy=False)
+
+        if np.any(bass_mask):
+            bass_energy[frame_idx] = float(np.mean(spectrum[bass_mask]))
+        if np.any(mid_mask):
+            mid_energy[frame_idx] = float(np.mean(spectrum[mid_mask]))
+        if np.any(high_mask):
+            high_energy[frame_idx] = float(np.mean(spectrum[high_mask]))
+
+    return bass_energy, mid_energy, high_energy
 
 
 def _sample_frame_feature(values: np.ndarray, onset_time: float, sr: int, hop: int = 512) -> float:
