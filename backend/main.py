@@ -267,6 +267,20 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
         intervals.append(max(0.001, beats[i + 1] - beats[i]))
     default_interval = sum(intervals) / len(intervals) if intervals else 0.5
 
+    def spacing_multiplier_from_star(value: float) -> float:
+        # Aligns with common difficulty spacing ranges.
+        if value <= 2.0:
+            return 35.0
+        if value <= 3.5:
+            return 55.0 + (value - 2.0) * 8.0
+        if value <= 5.5:
+            return 90.0 + (value - 3.5) * 10.0
+        if value <= 7.5:
+            return 120.0 + (value - 5.5) * 20.0
+        return 160.0 + (value - 7.5) * 16.0
+
+    spacing_multiplier = spacing_multiplier_from_star(star)
+
     hit_objects: list[HitObject] = []
     last_time = -10_000
     current_x = 256.0
@@ -276,7 +290,7 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     modes = ("arc", "zigzag", "mirror")
     mode_index = 0
     mode = modes[mode_index]
-    pattern_len = max(5, int(round(10 - min(star, 8.0) * 0.45)))
+    pattern_len = max(4, int(round(8 - min(star, 8.0) * 0.35)))
     anchors = (
         (128.0, 96.0),
         (384.0, 96.0),
@@ -319,17 +333,18 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
             continue
 
         interval = intervals[index] if index < len(intervals) else default_interval
-        interval_ratio = clamp(interval / max(default_interval, 0.001), 0.5, 1.75)
-        interval_factor = (interval_ratio - 0.5) / (1.75 - 0.5)
-        # time-distance-equality: shorter rhythms are closer, but still maintain readable spacing floors.
-        jump = (
-            base_min_jump * (0.75 + 0.45 * strength)
-            + (base_max_jump - base_min_jump) * (0.45 * strength + 0.55 * interval_factor)
-        )
-        jump = max(jump, min_note_distance * 1.05)
+        interval_ratio = interval / max(default_interval, 0.001)
+        # Explicit time-distance equality core:
+        # spacing = (time_since_last / base_beat_duration) * difficulty_multiplier
+        jump = interval_ratio * spacing_multiplier
+        # local intensity adjustment (±10%)
+        jump *= 0.92 + 0.2 * strength
+        # readability and bounds sanity clamps
+        jump = clamp(jump, min_note_distance * 1.05, min(240.0, base_max_jump))
 
         # Change movement mode regularly to avoid long single-line chains.
-        if index % pattern_len == 0:
+        intensity_flip = strength > 0.82 and index % 2 == 0
+        if index % pattern_len == 0 or intensity_flip:
             mode_index = (mode_index + 1) % len(modes)
             mode = modes[mode_index]
             direction *= -1.0
