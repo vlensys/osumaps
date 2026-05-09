@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const MB = 1024 * 1024;
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  (typeof window !== "undefined" &&
+  window.location.hostname !== "localhost" &&
+  window.location.hostname !== "127.0.0.1"
+    ? "https://osumaps.vercel.app/api"
+    : "http://127.0.0.1:8000");
 
 const emptyMetadata = {
   title: "",
