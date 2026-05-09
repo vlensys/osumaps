@@ -32,7 +32,7 @@ jobs:
 
       - name: build
         env:
-          VITE_API_BASE: https://osumaps.vercel.app/api
+          VITE_API_BASE: https://osumaps.onrender.com/api
         run: npm run build
 
       - name: upload artifact
