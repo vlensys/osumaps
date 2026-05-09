@@ -258,9 +258,9 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     min_x, max_x = margin, 512 - margin
     min_y, max_y = margin, 384 - margin
 
-    base_min_jump = 24.0 + 5.2 * star
-    base_max_jump = 72.0 + 15.0 * star
-    min_note_distance = max(radius * 1.2, 24.0 + 2.4 * star)
+    base_min_jump = 34.0 + 6.0 * star
+    base_max_jump = 110.0 + 22.0 * star
+    min_note_distance = max(radius * 1.4, 32.0 + 3.5 * star)
 
     intervals = []
     for i in range(len(beats) - 1):
@@ -272,9 +272,37 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     current_x = 256.0
     current_y = 192.0
     angle = 0.0
+    direction = 1.0
+    modes = ("arc", "zigzag", "mirror")
+    mode_index = 0
+    mode = modes[mode_index]
+    pattern_len = max(5, int(round(10 - min(star, 8.0) * 0.45)))
+    anchors = (
+        (128.0, 96.0),
+        (384.0, 96.0),
+        (384.0, 288.0),
+        (128.0, 288.0),
+        (256.0, 192.0),
+    )
 
     def clamp(value: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, value))
+
+    def is_too_linear(px: float, py: float) -> bool:
+        if len(hit_objects) < 2:
+            return False
+        prev = hit_objects[-1]
+        prev2 = hit_objects[-2]
+        v1x = prev.x - prev2.x
+        v1y = prev.y - prev2.y
+        v2x = px - prev.x
+        v2y = py - prev.y
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return False
+        cosine = (v1x * v2x + v1y * v2y) / (n1 * n2)
+        return cosine > 0.985 and n2 < base_max_jump * 0.95
 
     for index, beat_sec in enumerate(beats):
         if len(hit_objects) >= max_notes:
@@ -293,29 +321,51 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
         interval = intervals[index] if index < len(intervals) else default_interval
         interval_ratio = clamp(interval / max(default_interval, 0.001), 0.5, 1.75)
         interval_factor = (interval_ratio - 0.5) / (1.75 - 0.5)
-        # time-distance-equality base: shorter rhythms -> smaller spacing.
-        jump = base_min_jump + (base_max_jump - base_min_jump) * (0.65 * strength + 0.35 * interval_factor)
+        # time-distance-equality: shorter rhythms are closer, but still maintain readable spacing floors.
+        jump = (
+            base_min_jump * (0.75 + 0.45 * strength)
+            + (base_max_jump - base_min_jump) * (0.45 * strength + 0.55 * interval_factor)
+        )
+        jump = max(jump, min_note_distance * 1.05)
 
-        # Use centroid as directional change driver and strength as extra movement weight.
-        turn = (centroid - 0.5) * 1.9
-        if strength > 0.85:
-            turn += 0.35 if index % 2 == 0 else -0.35
+        # Change movement mode regularly to avoid long single-line chains.
+        if index % pattern_len == 0:
+            mode_index = (mode_index + 1) % len(modes)
+            mode = modes[mode_index]
+            direction *= -1.0
+            anchor = anchors[(index // pattern_len + int(centroid * 2.0)) % len(anchors)]
+            target_angle = math.atan2(anchor[1] - current_y, anchor[0] - current_x)
+            angle = 0.55 * angle + 0.45 * target_angle
+
+        phase = index % pattern_len
+        if mode == "arc":
+            turn = direction * (0.25 + 0.75 * abs(centroid - 0.5))
+        elif mode == "zigzag":
+            turn = direction * (1.05 if phase % 2 == 0 else -1.05)
+        else:  # mirror
+            turn = direction * (0.9 if (phase // 2) % 2 == 0 else -0.9)
+
+        if strength > 0.83:
+            turn += direction * (0.25 if index % 2 == 0 else -0.25)
         angle += turn
 
         candidate_x = current_x
         candidate_y = current_y
         found = False
-        for attempt in range(14):
-            step = jump * (1.0 + 0.05 * attempt)
-            px = current_x + step * math.cos(angle)
-            py = current_y + step * math.sin(angle)
+        for attempt in range(20):
+            ring = attempt // 7
+            jitter_cycle = (0.0, 0.35, -0.35, 0.8, -0.8, 1.25, -1.25)
+            test_angle = angle + direction * jitter_cycle[attempt % len(jitter_cycle)] + ring * 0.2 * direction
+            step = jump * (1.0 + 0.08 * ring)
+            px = current_x + step * math.cos(test_angle)
+            py = current_y + step * math.sin(test_angle)
 
             if px < min_x or px > max_x:
-                angle = math.pi - angle
-                px = clamp(px, min_x, max_x)
+                test_angle = math.pi - test_angle
+                px = clamp(current_x + step * math.cos(test_angle), min_x, max_x)
             if py < min_y or py > max_y:
-                angle = -angle
-                py = clamp(py, min_y, max_y)
+                test_angle = -test_angle
+                py = clamp(current_y + step * math.sin(test_angle), min_y, max_y)
 
             if hit_objects:
                 prev = hit_objects[-1]
@@ -323,16 +373,22 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
                 dy = py - prev.y
                 dist = (dx * dx + dy * dy) ** 0.5
                 if dist < min_note_distance:
-                    angle += 0.55
                     continue
 
+            if is_too_linear(px, py):
+                continue
+
             candidate_x, candidate_y = px, py
+            angle = test_angle
             found = True
             break
 
         if not found:
-            candidate_x = clamp(current_x + jump, min_x, max_x)
-            candidate_y = clamp(current_y + jump * 0.2, min_y, max_y)
+            # Fallback: orbit around center instead of extending a straight line.
+            orbit_angle = angle + direction * 1.2
+            candidate_x = clamp(256.0 + (jump * 0.85) * math.cos(orbit_angle), min_x, max_x)
+            candidate_y = clamp(192.0 + (jump * 0.85) * math.sin(orbit_angle), min_y, max_y)
+            angle = orbit_angle
 
         current_x, current_y = candidate_x, candidate_y
         x = int(round(candidate_x))
