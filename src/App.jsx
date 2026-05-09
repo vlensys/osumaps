@@ -13,14 +13,28 @@ const emptyMetadata = {
 };
 
 const defaultMapSettings = {
-  starRating: 5.0,
+  starRating: 3.0,
+  difficultyLabel: "Hard",
   meter: 4,
   sampleSet: 1,
   sampleIndex: 0,
   timingVolume: 70,
   effects: 0,
   maxNotes: 500,
-  noteDensity: 0.78
+  circleSize: 4.0,
+  approachRate: 6.7,
+  overallDifficulty: 5.6,
+  hpDrain: 4.6,
+  sliderMultiplier: 1.3,
+  estimatedStar: null
+};
+
+const difficultyPresets = {
+  Easy: { cs: 4.8, ar: 4.2, od: 2.6, hp: 2.6, sv: 0.7, star: 1.6 },
+  Normal: { cs: 4.4, ar: 5.6, od: 4.2, hp: 3.5, sv: 0.9, star: 2.5 },
+  Hard: { cs: 4.0, ar: 6.7, od: 5.6, hp: 4.6, sv: 1.3, star: 3.5 },
+  Insane: { cs: 3.6, ar: 7.6, od: 6.6, hp: 5.6, sv: 1.6, star: 4.8 },
+  Expert: { cs: 3.0, ar: 8.7, od: 7.6, hp: 6.6, sv: 1.9, star: 6.2 }
 };
 
 function parseName(name) {
@@ -53,6 +67,14 @@ function cleanField(value, fallback = "") {
 function sanitizeFilenamePart(value, fallback) {
   const normalized = cleanField(value, fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
   return normalized || fallback;
+}
+
+function difficultyFromStars(star) {
+  if (star < 2) return "Easy";
+  if (star < 3) return "Normal";
+  if (star < 4) return "Hard";
+  if (star < 5.5) return "Insane";
+  return "Expert";
 }
 
 const CRC_TABLE = (() => {
@@ -168,174 +190,6 @@ function buildZipStore(entries) {
   return new Blob(chunks, { type: "application/zip" });
 }
 
-function movingAverage(values, windowSize) {
-  const output = new Array(values.length).fill(0);
-  let sum = 0;
-  for (let i = 0; i < values.length; i += 1) {
-    sum += values[i];
-    if (i >= windowSize) sum -= values[i - windowSize];
-    const divisor = i < windowSize ? i + 1 : windowSize;
-    output[i] = sum / divisor;
-  }
-  return output;
-}
-
-function findMaxIndex(values, endExclusive = values.length) {
-  let bestIndex = 0;
-  let bestValue = Number.NEGATIVE_INFINITY;
-  const end = Math.max(1, Math.min(endExclusive, values.length));
-  for (let i = 0; i < end; i += 1) {
-    if (values[i] > bestValue) {
-      bestValue = values[i];
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
-}
-
-async function analyzeAudioClientSide(file) {
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  if (!AudioCtx) throw new Error("web audio api is not available in this browser");
-
-  const context = new AudioCtx();
-  try {
-    const input = await file.arrayBuffer();
-    const decoded = await context.decodeAudioData(input.slice(0));
-    const sampleRate = decoded.sampleRate;
-    const channelCount = decoded.numberOfChannels;
-    const sampleCount = decoded.length;
-    const durationSec = decoded.duration;
-
-    if (sampleCount < 2048) throw new Error("audio is too short for analysis");
-
-    const mono = new Float32Array(sampleCount);
-    for (let ch = 0; ch < channelCount; ch += 1) {
-      const channel = decoded.getChannelData(ch);
-      for (let i = 0; i < sampleCount; i += 1) mono[i] += channel[i] / channelCount;
-    }
-
-    const frameSize = 1024;
-    const hopSize = 512;
-    const frameCount = Math.max(1, Math.floor((sampleCount - frameSize) / hopSize) + 1);
-    const energy = new Array(frameCount).fill(0);
-    const zcr = new Array(frameCount).fill(0);
-
-    for (let frame = 0; frame < frameCount; frame += 1) {
-      const start = frame * hopSize;
-      let sumSquares = 0;
-      let zeroCrossings = 0;
-      let prev = mono[start];
-      for (let i = 0; i < frameSize; i += 1) {
-        const sample = mono[start + i] ?? 0;
-        sumSquares += sample * sample;
-        if (i > 0 && ((sample >= 0 && prev < 0) || (sample < 0 && prev >= 0))) zeroCrossings += 1;
-        prev = sample;
-      }
-      energy[frame] = Math.sqrt(sumSquares / frameSize);
-      zcr[frame] = zeroCrossings / frameSize;
-    }
-
-    const onset = new Array(frameCount).fill(0);
-    for (let i = 1; i < frameCount; i += 1) onset[i] = Math.max(0, energy[i] - energy[i - 1]);
-    const onsetSmoothed = movingAverage(onset, 4);
-
-    const framesPerSecond = sampleRate / hopSize;
-    const minBpm = 60;
-    const maxBpm = 220;
-    const minLag = Math.max(1, Math.round((framesPerSecond * 60) / maxBpm));
-    const maxLag = Math.max(minLag + 1, Math.round((framesPerSecond * 60) / minBpm));
-
-    let bestLag = Math.round((framesPerSecond * 60) / 120);
-    let bestScore = Number.NEGATIVE_INFINITY;
-    for (let lag = minLag; lag <= maxLag; lag += 1) {
-      let score = 0;
-      for (let i = lag; i < onsetSmoothed.length; i += 1) score += onsetSmoothed[i] * onsetSmoothed[i - lag];
-      if (score > bestScore) {
-        bestScore = score;
-        bestLag = lag;
-      }
-    }
-
-    const bpm = (60 * framesPerSecond) / bestLag;
-    const beatStepSec = 60 / Math.max(1, bpm);
-
-    // Peak-pick onset candidates (local max + local mean threshold + minimum distance).
-    // This follows standard onset peak-picking heuristics used in MIR literature.
-    const preMax = 2;
-    const postMax = 2;
-    const preAvg = 8;
-    const postAvg = 4;
-    const waitFrames = Math.max(2, Math.round(framesPerSecond * Math.max(0.06, beatStepSec * 0.28)));
-    const meanOnset = onsetSmoothed.reduce((a, b) => a + b, 0) / Math.max(1, onsetSmoothed.length);
-    const varianceOnset =
-      onsetSmoothed.reduce((a, b) => a + (b - meanOnset) * (b - meanOnset), 0) /
-      Math.max(1, onsetSmoothed.length);
-    const stdOnset = Math.sqrt(varianceOnset);
-    const delta = stdOnset * 0.35;
-
-    const peakFrames = [];
-    let previousPeak = -waitFrames;
-    for (let n = 1; n < onsetSmoothed.length - 1; n += 1) {
-      const maxStart = Math.max(0, n - preMax);
-      const maxEnd = Math.min(onsetSmoothed.length, n + postMax + 1);
-      let localMax = Number.NEGATIVE_INFINITY;
-      for (let i = maxStart; i < maxEnd; i += 1) localMax = Math.max(localMax, onsetSmoothed[i]);
-
-      const avgStart = Math.max(0, n - preAvg);
-      const avgEnd = Math.min(onsetSmoothed.length, n + postAvg + 1);
-      let localSum = 0;
-      for (let i = avgStart; i < avgEnd; i += 1) localSum += onsetSmoothed[i];
-      const localMean = localSum / Math.max(1, avgEnd - avgStart);
-
-      const isPeak = onsetSmoothed[n] === localMax && onsetSmoothed[n] >= localMean + delta;
-      const respectsWait = n - previousPeak > waitFrames;
-
-      if (isPeak && respectsWait) {
-        peakFrames.push(n);
-        previousPeak = n;
-      }
-    }
-
-    const timingSearchFrames = Math.min(frameCount, Math.round(framesPerSecond * 8));
-    const firstBeatFrame = findMaxIndex(onsetSmoothed, timingSearchFrames);
-    const firstBeatSec = (firstBeatFrame * hopSize) / sampleRate;
-
-    // Stable timing grid for [TimingPoints].
-    const timingBeats = [];
-    for (let t = firstBeatSec; t < durationSec; t += beatStepSec) timingBeats.push(t);
-    for (let t = firstBeatSec - beatStepSec; t > 0; t -= beatStepSec) timingBeats.unshift(t);
-
-    // Note candidates follow detected onsets, not pure BPM grid.
-    let beats = peakFrames.map((frame) => (frame * hopSize) / sampleRate);
-    if (beats.length < 8) {
-      // Fallback for very flat audio where onset peaks are weak.
-      beats = [...timingBeats];
-    }
-
-    const beatStrengths = beats.map((beatSec) => {
-      const frame = Math.min(frameCount - 1, Math.max(0, Math.round((beatSec * sampleRate) / hopSize)));
-      return onsetSmoothed[frame] ?? 0;
-    });
-
-    const beatCentroids = beats.map((beatSec) => {
-      const frame = Math.min(frameCount - 1, Math.max(0, Math.round((beatSec * sampleRate) / hopSize)));
-      return zcr[frame] ?? 0;
-    });
-
-    return {
-      bpm: Number(bpm.toFixed(3)),
-      beats: beats.map((value) => Number(value.toFixed(4))),
-      beat_count: beats.length,
-      timing_beats: timingBeats.map((value) => Number(value.toFixed(4))),
-      duration_sec: Number(durationSec.toFixed(4)),
-      beat_strengths: beatStrengths.map((value) => Number(value.toFixed(6))),
-      beat_centroids: beatCentroids.map((value) => Number(value.toFixed(6)))
-    };
-  } finally {
-    await context.close();
-  }
-}
-
 function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectLines, mapSettings }) {
   const title = cleanField(metadata.title, "untitled");
   const artist = cleanField(metadata.artist, "unknown artist");
@@ -343,12 +197,11 @@ function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectL
   const version = cleanField(metadata.version, "generated");
   const source = cleanField(metadata.source, "");
   const tags = cleanField(metadata.tags, "auto generated osumaps");
-  const star = Number.isFinite(mapSettings?.starRating) ? mapSettings.starRating : 5;
-  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-  const hp = clamp(2.5 + star * 0.65, 2, 9);
-  const cs = clamp(2.7 + star * 0.35, 2, 7);
-  const od = clamp(3 + star * 0.7, 2, 9.5);
-  const ar = clamp(4 + star * 0.6, 2, 10);
+  const hp = Number.isFinite(mapSettings?.hpDrain) ? mapSettings.hpDrain : 4.6;
+  const cs = Number.isFinite(mapSettings?.circleSize) ? mapSettings.circleSize : 4.0;
+  const od = Number.isFinite(mapSettings?.overallDifficulty) ? mapSettings.overallDifficulty : 5.6;
+  const ar = Number.isFinite(mapSettings?.approachRate) ? mapSettings.approachRate : 6.7;
+  const sv = Number.isFinite(mapSettings?.sliderMultiplier) ? mapSettings.sliderMultiplier : 1.3;
 
   return [
     "osu file format v128",
@@ -387,7 +240,7 @@ function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectL
     `CircleSize:${cs.toFixed(1)}`,
     `OverallDifficulty:${od.toFixed(1)}`,
     `ApproachRate:${ar.toFixed(1)}`,
-    "SliderMultiplier:1.4",
+    `SliderMultiplier:${sv.toFixed(2)}`,
     "SliderTickRate:1",
     "",
     "[Events]",
@@ -597,7 +450,37 @@ export default function App() {
   };
 
   const setSetting = (field, value) => {
-    setMapSettings((current) => ({ ...current, [field]: value }));
+    setMapSettings((current) => {
+      const next = { ...current, [field]: value };
+      if (field === "starRating") {
+        const label = difficultyFromStars(Number(value));
+        const preset = difficultyPresets[label];
+        return {
+          ...next,
+          difficultyLabel: label,
+          circleSize: preset.cs,
+          approachRate: preset.ar,
+          overallDifficulty: preset.od,
+          hpDrain: preset.hp,
+          sliderMultiplier: preset.sv,
+          estimatedStar: null
+        };
+      }
+      if (field === "difficultyLabel" && difficultyPresets[value]) {
+        const preset = difficultyPresets[value];
+        return {
+          ...next,
+          starRating: preset.star,
+          circleSize: preset.cs,
+          approachRate: preset.ar,
+          overallDifficulty: preset.od,
+          hpDrain: preset.hp,
+          sliderMultiplier: preset.sv,
+          estimatedStar: null
+        };
+      }
+      return next;
+    });
   };
 
   const analyzeBpm = async () => {
@@ -606,7 +489,17 @@ export default function App() {
     setAnalysisError("");
 
     try {
-      const payload = await analyzeAudioClientSide(audioFile);
+      const formData = new FormData();
+      formData.append("audio", audioFile);
+      const response = await fetch(`${API_BASE}/analyze/bpm`, {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        throw new Error(errorPayload?.detail || "analysis failed");
+      }
+      const payload = await response.json();
       setAnalysis(payload);
       setNotesError("");
       setHitObjects([]);
@@ -623,38 +516,80 @@ export default function App() {
     }
   };
 
-  const generateTimingPoints = async (analysisPayload = analysis) => {
-    if (!analysisPayload) return null;
+  const requestFullMap = async () => {
+    if (!audioFile) return null;
+    const formData = new FormData();
+    formData.append("audio", audioFile);
+    formData.append("difficulty_star", String(mapSettings.starRating));
+    formData.append("difficulty_label", mapSettings.difficultyLabel);
+    formData.append("max_notes", String(mapSettings.maxNotes));
+    formData.append("meter", String(mapSettings.meter));
+    formData.append("sample_set", String(mapSettings.sampleSet));
+    formData.append("sample_index", String(mapSettings.sampleIndex));
+    formData.append("volume", String(mapSettings.timingVolume));
+    formData.append("effects", String(mapSettings.effects));
+
+    const response = await fetch(`${API_BASE}/generate/full-map`, {
+      method: "POST",
+      body: formData
+    });
+    if (!response.ok) {
+      const errorPayload = await response.json().catch(() => null);
+      const detail = errorPayload?.detail || "full pipeline request failed";
+      if (response.status === 413) {
+        throw new Error("upload too large for hosted backend, try a smaller file or run backend locally");
+      }
+      throw new Error(detail);
+    }
+    return response.json();
+  };
+
+  const applyFullMapPayload = (payload) => {
+    const nextTiming = ensureTimingStartsBeforeHits(payload.timing_points ?? [], payload.hit_objects ?? []);
+    const nextHitObjects = payload.hit_objects ?? [];
+    const nextSettings = payload.settings || {};
+    setTimingPoints(nextTiming);
+    setHitObjects(nextHitObjects);
+    setMapSettings((current) => ({
+      ...current,
+      difficultyLabel: nextSettings.difficulty || current.difficultyLabel,
+      starRating: Number.isFinite(nextSettings.target_star) ? nextSettings.target_star : current.starRating,
+      circleSize: Number.isFinite(nextSettings.circle_size) ? nextSettings.circle_size : current.circleSize,
+      approachRate: Number.isFinite(nextSettings.approach_rate)
+        ? nextSettings.approach_rate
+        : current.approachRate,
+      overallDifficulty: Number.isFinite(nextSettings.overall_difficulty)
+        ? nextSettings.overall_difficulty
+        : current.overallDifficulty,
+      hpDrain: Number.isFinite(nextSettings.hp_drain) ? nextSettings.hp_drain : current.hpDrain,
+      sliderMultiplier: Number.isFinite(nextSettings.slider_multiplier)
+        ? nextSettings.slider_multiplier
+        : current.sliderMultiplier,
+      estimatedStar: Number.isFinite(nextSettings.estimated_star)
+        ? nextSettings.estimated_star
+        : current.estimatedStar
+    }));
+    setAnalysis({
+      bpm: payload.bpm,
+      beat_count: payload.beat_count,
+      beats: nextHitObjects.map((obj) => Number((obj.time / 1000).toFixed(4))),
+      duration_sec: payload.duration_sec,
+      beat_strengths: [],
+      beat_centroids: []
+    });
+    return { nextTiming, nextHitObjects };
+  };
+
+  const generateTimingPoints = async () => {
     setIsGeneratingTiming(true);
     setTimingError("");
 
     try {
-      const response = await fetch(`${API_BASE}/generate/timing-points`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bpm: analysisPayload.bpm,
-          beats: analysisPayload.timing_beats ?? analysisPayload.beats,
-          meter: mapSettings.meter,
-          sample_set: mapSettings.sampleSet,
-          sample_index: mapSettings.sampleIndex,
-          volume: mapSettings.timingVolume,
-          effects: mapSettings.effects
-        })
-      });
-
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => null);
-        throw new Error(errorPayload?.detail || "timing point generation failed");
-      }
-
-      const payload = await response.json();
-      const normalized = ensureTimingStartsBeforeHits(payload.timing_points ?? [], hitObjects);
-      setTimingPoints(normalized);
-      setNotesError("");
-      setHitObjects([]);
+      const payload = await requestFullMap();
+      if (!payload) return null;
+      const { nextTiming } = applyFullMapPayload(payload);
       setValidationResult(null);
-      return normalized;
+      return nextTiming;
     } catch (error) {
       setTimingError(error.message || "timing point generation failed");
       setTimingPoints([]);
@@ -664,35 +599,17 @@ export default function App() {
     }
   };
 
-  const generateHitObjects = async (analysisPayload = analysis) => {
-    if (!analysisPayload) return null;
+  const generateHitObjects = async () => {
     setIsGeneratingNotes(true);
     setNotesError("");
 
     try {
-      const response = await fetch(`${API_BASE}/generate/hit-objects`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          beats: analysisPayload.beats,
-          beat_strengths: analysisPayload.beat_strengths ?? [],
-          beat_centroids: analysisPayload.beat_centroids ?? [],
-          max_notes: mapSettings.maxNotes,
-          density: mapSettings.noteDensity,
-          difficulty_star: mapSettings.starRating
-        })
-      });
-
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => null);
-        throw new Error(errorPayload?.detail || "hit object generation failed");
-      }
-
-      const payload = await response.json();
-      setHitObjects(payload.hit_objects ?? []);
+      const payload = await requestFullMap();
+      if (!payload) return null;
+      const { nextHitObjects } = applyFullMapPayload(payload);
       setExportError("");
       setValidationResult(null);
-      return payload.hit_objects ?? [];
+      return nextHitObjects;
     } catch (error) {
       setNotesError(error.message || "hit object generation failed");
       setHitObjects([]);
@@ -710,34 +627,24 @@ export default function App() {
     setNotesError("");
     setExportError("");
 
-    const analysisPayload = await analyzeBpm();
-    if (!analysisPayload) {
+    try {
+      const payload = await requestFullMap();
+      if (!payload) {
+        setIsRunningPipeline(false);
+        return;
+      }
+      const { nextTiming, nextHitObjects } = applyFullMapPayload(payload);
+      const result = validateBeatmapDraft({
+        metadata,
+        timingPoints: nextTiming,
+        hitObjects: nextHitObjects
+      });
+      setValidationResult(result);
+    } catch (error) {
+      setAnalysisError(error.message || "full pipeline failed");
+    } finally {
       setIsRunningPipeline(false);
-      return;
     }
-
-    const generatedTiming = await generateTimingPoints(analysisPayload);
-    if (!generatedTiming || generatedTiming.length === 0) {
-      setIsRunningPipeline(false);
-      return;
-    }
-
-    const generatedNotes = await generateHitObjects(analysisPayload);
-    if (!generatedNotes || generatedNotes.length === 0) {
-      setIsRunningPipeline(false);
-      return;
-    }
-
-    const fixedTiming = ensureTimingStartsBeforeHits(generatedTiming, generatedNotes);
-    if (fixedTiming !== generatedTiming) setTimingPoints(fixedTiming);
-
-    const result = validateBeatmapDraft({
-      metadata,
-      timingPoints: fixedTiming,
-      hitObjects: generatedNotes
-    });
-    setValidationResult(result);
-    setIsRunningPipeline(false);
   };
 
   const exportOszFile = async () => {
@@ -798,7 +705,7 @@ export default function App() {
         <p className="text-sm uppercase tracking-[0.25em] text-cyan-300">osumaps</p>
         <h1 className="mt-2 text-3xl font-bold text-white">audio to osu! lazer converter</h1>
         <p className="mt-3 max-w-2xl text-slate-300">
-          step 1: upload an audio track. files stay on-device and are used for local analysis + map generation.
+          step 1: upload an audio track. files are sent to the backend only for analysis/generation and are not stored.
         </p>
       </header>
 
@@ -858,7 +765,7 @@ export default function App() {
               disabled={isAnalyzing || isRunningPipeline}
               className="mt-4 rounded-lg bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {isAnalyzing ? "analyzing..." : "analyze bpm"}
+              {isAnalyzing ? "analyzing..." : "analyze audio"}
             </button>
             <button
               type="button"
@@ -872,7 +779,7 @@ export default function App() {
             {analysis && (
               <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200">
                 <p>bpm: {analysis.bpm}</p>
-                <p>detected beats: {analysis.beat_count}</p>
+                <p>detected onsets: {analysis.beat_count}</p>
                 <p>first beat at: {analysis.beats[0] ?? "n/a"} sec</p>
                 <p>beat length: {analysis.bpm > 0 ? (60000 / analysis.bpm).toFixed(2) : "n/a"} ms</p>
               </div>
@@ -880,7 +787,7 @@ export default function App() {
             <button
               type="button"
               onClick={generateTimingPoints}
-              disabled={!analysis || isGeneratingTiming}
+              disabled={!audioFile || isGeneratingTiming}
               className="mt-3 rounded-lg bg-amber-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {isGeneratingTiming ? "generating timing points..." : "generate timing points"}
@@ -897,7 +804,7 @@ export default function App() {
             <button
               type="button"
               onClick={generateHitObjects}
-              disabled={!analysis || isGeneratingNotes}
+              disabled={!audioFile || isGeneratingNotes}
               className="mt-3 rounded-lg bg-fuchsia-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-fuchsia-200 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {isGeneratingNotes ? "generating hit objects..." : "generate note pattern"}
@@ -985,20 +892,44 @@ export default function App() {
             <h3 className="mt-6 text-lg font-semibold text-slate-100">generation settings</h3>
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm text-slate-300">
               <label className="col-span-2">
-                <span className="mb-1 block">difficulty stars ({mapSettings.starRating.toFixed(1)}★)</span>
+                <span className="mb-1 block">difficulty tier</span>
+                <select
+                  value={mapSettings.difficultyLabel}
+                  onChange={(event) => setSetting("difficultyLabel", event.target.value)}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
+                >
+                  {Object.keys(difficultyPresets).map((label) => (
+                    <option key={label} value={label}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="col-span-2">
+                <span className="mb-1 block">target stars ({mapSettings.starRating.toFixed(1)}★)</span>
                 <input
                   type="range"
                   min="1"
-                  max="10"
+                  max="7"
                   step="0.1"
                   value={mapSettings.starRating}
                   onChange={(event) => setSetting("starRating", Number(event.target.value))}
                   className="w-full accent-cyan-300"
                 />
                 <span className="mt-1 block text-xs text-slate-400">
-                  target generator intensity, not exact lazer star calculation
+                  generation auto-calibrates to roughly this star range
                 </span>
               </label>
+              <div className="col-span-2 rounded-lg border border-slate-700 bg-slate-950/60 p-3 text-xs text-slate-300">
+                {Number.isFinite(mapSettings.estimatedStar) && (
+                  <p className="mb-1 text-cyan-300">estimated stars: {mapSettings.estimatedStar.toFixed(2)}★</p>
+                )}
+                <p>cs: {mapSettings.circleSize.toFixed(2)}</p>
+                <p>ar: {mapSettings.approachRate.toFixed(2)}</p>
+                <p>od: {mapSettings.overallDifficulty.toFixed(2)}</p>
+                <p>hp: {mapSettings.hpDrain.toFixed(2)}</p>
+                <p>sv: {mapSettings.sliderMultiplier.toFixed(2)}</p>
+              </div>
               <label>
                 <span className="mb-1 block">meter</span>
                 <input
@@ -1061,18 +992,6 @@ export default function App() {
                   max="2000"
                   value={mapSettings.maxNotes}
                   onChange={(event) => setSetting("maxNotes", Number(event.target.value))}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
-                />
-              </label>
-              <label>
-                <span className="mb-1 block">note density (0.1-1.0)</span>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0.1"
-                  max="1"
-                  value={mapSettings.noteDensity}
-                  onChange={(event) => setSetting("noteDensity", Number(event.target.value))}
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"
                 />
               </label>

@@ -1,4 +1,4 @@
-﻿# osumaps
+# osumaps
 
 audio to osu! lazer map converter.
 
@@ -9,66 +9,47 @@ audio to osu! lazer map converter.
 
 ## how to use
 
-1. open the app and upload an `.mp3` or `.flac` file.
-2. edit metadata fields on the right (title, artist, creator, difficulty name).
-3. click `run full pipeline`.
-4. check `sanity status`.
-5. click `export .osz`.
-6. import the exported `.osz` package in osu! lazer.
+1. upload an `.mp3` or `.flac`.
+2. review or edit metadata (`title`, `artist`, `creator`, `version`).
+3. choose `difficulty tier` and `target stars`.
+4. click `run full pipeline`.
+5. confirm `sanity status` and preview playback sync.
+6. click `export .osz` and import it in osu! lazer.
 
-## manual buttons (optional)
+## generation settings
 
-- `analyze bpm`: local, browser-side BPM/beat detection (audio does not upload).
-- `generate timing points`: sends beat data to API and builds `[TimingPoints]`.
-- `generate note pattern`: sends beat features to API and builds `[HitObjects]`.
-- `run beatmap sanity check`: validates common format mistakes.
-
-## generation settings explained
-
-- `difficulty stars`:
-  - primary difficulty control (`1.0★` to `10.0★`).
-  - affects jump spacing, movement intensity, overlap avoidance strictness, and exported difficulty values (`hp/cs/od/ar`).
-  - this is a generator target value, not lazer's exact computed star rating.
-- `meter`:
-  - beats per measure used in `[TimingPoints]`.
-  - common values: `4` (most songs), `3` (waltz feel).
-- `timing volume`:
-  - hit sound sample volume value written into timing points (`0-100`).
-  - affects perceived loudness of map hit samples.
-- `sample set (0-3)`:
-  - timing point sample set id.
-  - `1` is standard default for most maps.
-- `sample index`:
-  - custom sample bank index for timing samples.
-  - leave `0` unless you use custom sample sets.
-- `effects`:
-  - timing point effects flag.
-  - keep `0` for normal behavior.
+- `difficulty tier`:
+  - picks a full difficulty profile at once (`cs`, `ar`, `od`, `hp`, `sv`) and mapping behavior.
+- `target stars`:
+  - calibration target for generated map strain (generator keeps output near this value).
+- `meter`, `timing volume`, `sample set`, `sample index`, `effects`:
+  - written into `[TimingPoints]`.
 - `max notes`:
-  - hard cap on generated hit objects.
-  - lower = sparser/easier drafts, higher = denser drafts.
-- `note density (0.1-1.0)`:
-  - intensity threshold for how many beats become notes.
-  - lower values generate more notes; higher values generate fewer notes.
+  - hard cap for generated hit objects.
 
-placement behavior:
-- generator uses both `x` and `y` axes.
-- spacing follows time-distance equality: shorter rhythms -> shorter spacing, stronger accents -> larger jumps.
-- notes are kept within playfield bounds and avoid near-overlap based on circle size.
-- rhythm follows detected onset peaks (musical transients), not only fixed metronome BPM ticks.
+## what the generator does
+
+- uses librosa onset detection, spectral flux, rms, and frequency bands (bass/mid/high).
+- places notes on detected onsets (not plain bpm grid).
+- applies time-distance equality so faster rhythms are tighter and slower rhythms jump farther.
+- spreads notes across both `x` and `y` axes and enforces minimum spacing.
+- writes `[Difficulty]` values directly into `.osu`:
+  - `HPDrainRate`
+  - `CircleSize`
+  - `OverallDifficulty`
+  - `ApproachRate`
+  - `SliderMultiplier`
 
 ## troubleshooting
 
-- `networkerror` / `cors` on analyze:
-  - fixed by local analysis in browser. no audio upload for BPM step.
-- `413` request entity too large:
-  - avoided for analyze step, because BPM is client-side.
+- `networkerror` / API failures:
+  - verify backend health at `https://osumaps.vercel.app/api/health`.
+- `413` on hosted backend:
+  - file is too large for current hosted request limits; try a smaller file or run backend locally.
 - `ses removing unpermitted intrinsics` logs:
-  - these logs are from browser extension sandboxing (not from this app code).
-- if API calls fail for timing/note generation:
-  - verify `https://osumaps.vercel.app/api/health` returns `{ "status": "ok" }`.
+  - from browser extension sandboxing, not this app.
 
-## notes
+## note
 
-- generated maps are auto-mapped drafts. always playtest and adjust in lazer editor.
-- this project does not store uploaded audio.
+- generated maps are drafts; playtest and refine in lazer editor.
+- uploaded audio is used only for generation and is not persisted by this app.

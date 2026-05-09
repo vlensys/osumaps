@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import math
+import os
 import tempfile
 from pathlib import Path
-import math
 from statistics import median
 
 import librosa
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -28,6 +30,7 @@ class BpmAnalysisResponse(BaseModel):
     duration_sec: float
     beat_strengths: list[float]
     beat_centroids: list[float]
+    timing_beats: list[float] = []
 
 
 class TimingPoint(BaseModel):
@@ -72,11 +75,118 @@ class HitObjectRequest(BaseModel):
     beat_centroids: list[float] = []
     max_notes: int = 400
     density: float = 0.75
-    difficulty_star: float = 5.0
+    difficulty_star: float = 3.0
 
 
 class HitObjectResponse(BaseModel):
     hit_objects: list[HitObject]
+
+
+class GeneratedNote(BaseModel):
+    time_ms: int
+    x: int
+    y: int
+    snap: str
+
+
+class GeneratedDifficulty(BaseModel):
+    difficulty: str
+    star_rating: float
+    notes: list[GeneratedNote]
+    spacing_notes: str
+
+
+class DifficultyGenerateResponse(BaseModel):
+    generated: list[GeneratedDifficulty]
+
+
+class DifficultySettings(BaseModel):
+    difficulty: str
+    target_star: float
+    estimated_star: float
+    circle_size: float
+    approach_rate: float
+    overall_difficulty: float
+    hp_drain: float
+    slider_multiplier: float
+
+
+class FullGenerationResponse(BaseModel):
+    bpm: float
+    beat_count: int
+    duration_sec: float
+    timing_points: list[TimingPoint]
+    hit_objects: list[HitObject]
+    settings: DifficultySettings
+
+
+DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
+    "Easy": {
+        "star_min": 1.0,
+        "star_max": 2.0,
+        "cs": 4.8,
+        "ar": 4.2,
+        "od": 2.6,
+        "hp": 2.6,
+        "sv": 0.7,
+        "spacing_mult": 35.0,
+        "spacing_difficulty_mult": 0.4,
+        "threshold": 0.62,
+        "allowed_snaps": ("1/1", "1/2"),
+    },
+    "Normal": {
+        "star_min": 2.0,
+        "star_max": 3.0,
+        "cs": 4.4,
+        "ar": 5.6,
+        "od": 4.2,
+        "hp": 3.5,
+        "sv": 0.9,
+        "spacing_mult": 60.0,
+        "spacing_difficulty_mult": 0.6,
+        "threshold": 0.52,
+        "allowed_snaps": ("1/1", "1/2", "1/4"),
+    },
+    "Hard": {
+        "star_min": 3.0,
+        "star_max": 4.0,
+        "cs": 4.0,
+        "ar": 6.7,
+        "od": 5.6,
+        "hp": 4.6,
+        "sv": 1.3,
+        "spacing_mult": 100.0,
+        "spacing_difficulty_mult": 0.9,
+        "threshold": 0.45,
+        "allowed_snaps": ("1/1", "1/2", "1/4"),
+    },
+    "Insane": {
+        "star_min": 4.0,
+        "star_max": 5.5,
+        "cs": 3.6,
+        "ar": 7.6,
+        "od": 6.6,
+        "hp": 5.6,
+        "sv": 1.6,
+        "spacing_mult": 140.0,
+        "spacing_difficulty_mult": 1.2,
+        "threshold": 0.36,
+        "allowed_snaps": ("1/2", "1/4", "1/6"),
+    },
+    "Expert": {
+        "star_min": 5.5,
+        "star_max": 7.0,
+        "cs": 3.0,
+        "ar": 8.7,
+        "od": 7.6,
+        "hp": 6.6,
+        "sv": 1.9,
+        "spacing_mult": 175.0,
+        "spacing_difficulty_mult": 1.5,
+        "threshold": 0.30,
+        "allowed_snaps": ("1/2", "1/4", "1/6"),
+    },
+}
 
 
 @app.get("/health")
@@ -219,221 +329,314 @@ def _generate_uninherited_points(payload: TimingPointRequest) -> list[TimingPoin
     return timing_points
 
 
-def _normalize(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    minimum = min(values)
-    maximum = max(values)
-    if maximum <= minimum:
-        return [0.5 for _ in values]
-    scale = maximum - minimum
-    return [(value - minimum) / scale for value in values]
+def _analyze_audio_librosa(path: Path) -> dict[str, object]:
+    y, sr = librosa.load(path.as_posix(), sr=None, mono=True)
 
-
-def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
-    beats = [float(value) for value in payload.beats if value >= 0]
-    if not beats:
-        raise HTTPException(status_code=400, detail="beats cannot be empty")
-
-    max_notes = min(max(payload.max_notes, 1), 2000)
-    density = min(max(payload.density, 0.1), 1.0)
-    star = min(max(payload.difficulty_star, 0.5), 10.0)
-
-    strength_values = payload.beat_strengths[: len(beats)] if payload.beat_strengths else [1.0] * len(beats)
-    centroid_values = payload.beat_centroids[: len(beats)] if payload.beat_centroids else [0.0] * len(beats)
-
-    normalized_strengths = _normalize([float(value) for value in strength_values])
-    normalized_centroids = _normalize([float(value) for value in centroid_values])
-    if not normalized_centroids:
-        normalized_centroids = [0.5] * len(beats)
-
-    sorted_strengths = sorted(normalized_strengths)
-    quantile_index = int((1.0 - density) * (len(sorted_strengths) - 1))
-    threshold = sorted_strengths[quantile_index] if sorted_strengths else 0.0
-
-    # osu! standard playfield is 512x384
-    cs = min(max(2.5 + star * 0.35, 2.0), 7.0)
-    radius = (54.4 - 4.48 * cs) * 1.00041
-    margin = int(max(radius + 8, 24))
-    min_x, max_x = margin, 512 - margin
-    min_y, max_y = margin, 384 - margin
-
-    base_min_jump = 34.0 + 6.0 * star
-    base_max_jump = 110.0 + 22.0 * star
-    min_note_distance = max(radius * 1.4, 32.0 + 3.5 * star)
-
-    intervals = []
-    for i in range(len(beats) - 1):
-        intervals.append(max(0.001, beats[i + 1] - beats[i]))
-    default_interval = sum(intervals) / len(intervals) if intervals else 0.5
-
-    def spacing_multiplier_from_star(value: float) -> float:
-        # Aligns with common difficulty spacing ranges.
-        if value <= 2.0:
-            return 35.0
-        if value <= 3.5:
-            return 55.0 + (value - 2.0) * 8.0
-        if value <= 5.5:
-            return 90.0 + (value - 3.5) * 10.0
-        if value <= 7.5:
-            return 120.0 + (value - 5.5) * 20.0
-        return 160.0 + (value - 7.5) * 16.0
-
-    spacing_multiplier = spacing_multiplier_from_star(star)
-
-    hit_objects: list[HitObject] = []
-    last_time = -10_000
-    current_x = 256.0
-    current_y = 192.0
-    angle = 0.0
-    direction = 1.0
-    modes = ("arc", "zigzag", "mirror")
-    mode_index = 0
-    mode = modes[mode_index]
-    pattern_len = max(4, int(round(8 - min(star, 8.0) * 0.35)))
-    anchors = (
-        (128.0, 96.0),
-        (384.0, 96.0),
-        (384.0, 288.0),
-        (128.0, 288.0),
-        (256.0, 192.0),
+    onset_times = librosa.onset.onset_detect(
+        y=y, sr=sr, units="time", delta=0.07, wait=10
     )
+    spectral_flux = librosa.onset.onset_strength(y=y, sr=sr)
+    rms = librosa.feature.rms(y=y)[0]
 
-    def clamp(value: float, lo: float, hi: float) -> float:
-        return max(lo, min(hi, value))
+    stft = np.abs(librosa.stft(y))
+    freqs = librosa.fft_frequencies(sr=sr)
+    bass_mask = freqs < 250
+    mid_mask = (freqs >= 250) & (freqs < 4000)
+    high_mask = freqs >= 4000
 
-    def is_too_linear(px: float, py: float) -> bool:
-        if len(hit_objects) < 2:
-            return False
-        prev = hit_objects[-1]
-        prev2 = hit_objects[-2]
-        v1x = prev.x - prev2.x
-        v1y = prev.y - prev2.y
-        v2x = px - prev.x
-        v2y = py - prev.y
-        n1 = math.hypot(v1x, v1y)
-        n2 = math.hypot(v2x, v2y)
-        if n1 < 1e-6 or n2 < 1e-6:
-            return False
-        cosine = (v1x * v2x + v1y * v2y) / (n1 * n2)
-        return cosine > 0.985 and n2 < base_max_jump * 0.95
+    bass_energy = stft[bass_mask, :].mean(axis=0) if np.any(bass_mask) else np.zeros(stft.shape[1])
+    mid_energy = stft[mid_mask, :].mean(axis=0) if np.any(mid_mask) else np.zeros(stft.shape[1])
+    high_energy = stft[high_mask, :].mean(axis=0) if np.any(high_mask) else np.zeros(stft.shape[1])
 
-    for index, beat_sec in enumerate(beats):
-        if len(hit_objects) >= max_notes:
-            break
-        strength = normalized_strengths[index] if index < len(normalized_strengths) else 0.5
-        centroid = normalized_centroids[index] if index < len(normalized_centroids) else 0.5
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
-        # Drop lower-energy beats to prevent overmapping.
-        if strength < threshold and index % 2 == 1:
+    centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    beat_strengths: list[float] = []
+    beat_centroids: list[float] = []
+    for frame in beat_frames:
+        frame_index = int(frame)
+        strength = float(spectral_flux[frame_index]) if frame_index < len(spectral_flux) else 0.0
+        centroid = float(centroids[frame_index]) if frame_index < len(centroids) else 0.0
+        beat_strengths.append(strength)
+        beat_centroids.append(centroid)
+
+    tempo_value = float(tempo[0] if hasattr(tempo, "__len__") else tempo)
+
+    return {
+        "y_len": len(y),
+        "sr": sr,
+        "onset_times": onset_times,
+        "spectral_flux": spectral_flux,
+        "rms": rms,
+        "bass_energy": bass_energy,
+        "mid_energy": mid_energy,
+        "high_energy": high_energy,
+        "tempo": max(1.0, tempo_value),
+        "beat_times": beat_times,
+        "duration": float(librosa.get_duration(y=y, sr=sr)),
+        "beat_strengths": beat_strengths,
+        "beat_centroids": beat_centroids,
+    }
+
+
+def _sample_frame_feature(values: np.ndarray, onset_time: float, sr: int, hop: int = 512) -> float:
+    frame = int(round((onset_time * sr) / hop))
+    frame = max(0, min(frame, len(values) - 1))
+    return float(values[frame])
+
+
+def _closest_snap(delta_ms: float, beat_ms: float, allowed_snaps: tuple[str, ...]) -> str:
+    divisors = {"1/1": 1.0, "1/2": 0.5, "1/4": 0.25, "1/6": 1.0 / 6.0}
+    best_snap = allowed_snaps[0]
+    best_err = float("inf")
+    for snap in allowed_snaps:
+        target = beat_ms * divisors[snap]
+        err = abs(delta_ms - target)
+        if err < best_err:
+            best_err = err
+            best_snap = snap
+    return best_snap
+
+
+def _profile_for_star(star_target: float) -> str:
+    if star_target < 2.0:
+        return "Easy"
+    if star_target < 3.0:
+        return "Normal"
+    if star_target < 4.0:
+        return "Hard"
+    if star_target < 5.5:
+        return "Insane"
+    return "Expert"
+
+
+def _resolve_profile(difficulty_label: str | None, star_target: float) -> tuple[str, dict[str, object]]:
+    if difficulty_label:
+        normalized = difficulty_label.strip().capitalize()
+        if normalized in DIFF_PROFILES:
+            return normalized, dict(DIFF_PROFILES[normalized])
+
+    selected = _profile_for_star(star_target)
+    profile = dict(DIFF_PROFILES[selected])
+    profile["star_min"] = max(float(profile["star_min"]), star_target - 0.5)
+    profile["star_max"] = min(float(profile["star_max"]), star_target + 0.5)
+    if float(profile["star_min"]) >= float(profile["star_max"]):
+        profile["star_min"] = star_target - 0.5
+        profile["star_max"] = star_target + 0.5
+    return selected, profile
+
+
+def _thin_notes(notes: list[GeneratedNote], max_notes: int) -> list[GeneratedNote]:
+    if len(notes) <= max_notes:
+        return notes
+    stride = max(1, len(notes) // max_notes)
+    thinned = notes[::stride]
+    if len(thinned) > max_notes:
+        thinned = thinned[:max_notes]
+    return thinned
+
+
+def _generate_notes_for_profile(features: dict[str, object], profile: dict[str, object]) -> tuple[list[GeneratedNote], float]:
+    onset_times = features["onset_times"]
+    if len(onset_times) == 0:
+        return [], 0.0
+
+    flux = features["spectral_flux"]
+    rms = features["rms"]
+    bass = features["bass_energy"]
+    high = features["high_energy"]
+    sr = int(features["sr"])
+    tempo = max(1.0, float(features["tempo"]))
+    beat_ms = 60000.0 / tempo
+
+    flux_max = float(np.max(flux) + 1e-9)
+    rms_max = float(np.max(rms) + 1e-9)
+
+    threshold = float(profile["threshold"])
+    spacing_mult = float(profile["spacing_mult"])
+    diff_mult = float(profile["spacing_difficulty_mult"])
+    allowed_snaps = tuple(profile["allowed_snaps"])
+    cs = float(profile["cs"])
+    ar = float(profile["ar"])
+    od = float(profile["od"])
+    hp = float(profile["hp"])
+
+    radius = (54.4 - 4.48 * cs) * 1.00041
+    min_note_distance = max(20.0, min(90.0, radius * 0.9))
+    min_delta_ms = beat_ms * (0.52 - (od / 20.0))
+    min_delta_ms = float(np.clip(min_delta_ms, 55.0, beat_ms * 0.55))
+    threshold = float(np.clip(threshold + np.interp(hp, [2.0, 7.0], [0.04, -0.03]), 0.1, 0.92))
+
+    notes: list[GeneratedNote] = []
+    prev_time_ms: int | None = None
+    prev_x, prev_y = 256.0, 192.0
+    used_positions: set[tuple[int, int]] = set()
+
+    bar_anchor_phase = 0.0
+    downbeat_cursor = 0
+    beat_times = features["beat_times"]
+
+    for onset in onset_times:
+        onset_time = float(onset)
+        while downbeat_cursor + 1 < len(beat_times) and beat_times[downbeat_cursor + 1] <= onset_time:
+            downbeat_cursor += 1
+            if downbeat_cursor % 4 == 0:
+                bar_anchor_phase += math.pi / 2.0
+
+        flux_score = _sample_frame_feature(flux, onset_time, sr) / flux_max
+        rms_score = _sample_frame_feature(rms, onset_time, sr) / rms_max
+        intensity = float(np.clip(0.6 * flux_score + 0.4 * rms_score, 0.0, 1.0))
+        if intensity < threshold:
             continue
 
-        time_ms = int(round(beat_sec * 1000))
-        if time_ms - last_time < 70:
+        bass_val = _sample_frame_feature(bass, onset_time, sr)
+        high_val = _sample_frame_feature(high, onset_time, sr)
+        freq_ratio = high_val / (bass_val + 1e-6)
+
+        time_ms = int(round(onset_time * 1000.0))
+        delta_ms = beat_ms if prev_time_ms is None else max(1.0, time_ms - prev_time_ms)
+        if prev_time_ms is not None and delta_ms < min_delta_ms and intensity < min(0.98, threshold + 0.1):
             continue
 
-        interval = intervals[index] if index < len(intervals) else default_interval
-        interval_ratio = interval / max(default_interval, 0.001)
-        # Explicit time-distance equality core:
-        # spacing = (time_since_last / base_beat_duration) * difficulty_multiplier
-        jump = interval_ratio * spacing_multiplier
-        # local intensity adjustment (±10%)
-        jump *= 0.92 + 0.2 * strength
-        # readability and bounds sanity clamps
-        jump = clamp(jump, min_note_distance * 1.05, min(240.0, base_max_jump))
+        distance = (delta_ms / beat_ms) * spacing_mult
+        distance *= (0.9 + 0.2 * intensity)
+        distance *= diff_mult
+        distance *= 0.9 + max(0.0, (ar - 5.0) * 0.05)
+        distance = float(np.clip(distance, min_note_distance, 320.0))
 
-        # Change movement mode regularly to avoid long single-line chains.
-        intensity_flip = strength > 0.82 and index % 2 == 0
-        if index % pattern_len == 0 or intensity_flip:
-            mode_index = (mode_index + 1) % len(modes)
-            mode = modes[mode_index]
-            direction *= -1.0
-            anchor = anchors[(index // pattern_len + int(centroid * 2.0)) % len(anchors)]
-            target_angle = math.atan2(anchor[1] - current_y, anchor[0] - current_x)
-            angle = 0.55 * angle + 0.45 * target_angle
+        angle = (freq_ratio * math.pi) + (onset_time % (2.0 * math.pi)) + bar_anchor_phase
 
-        phase = index % pattern_len
-        if mode == "arc":
-            turn = direction * (0.25 + 0.75 * abs(centroid - 0.5))
-        elif mode == "zigzag":
-            turn = direction * (1.05 if phase % 2 == 0 else -1.05)
-        else:  # mirror
-            turn = direction * (0.9 if (phase // 2) % 2 == 0 else -0.9)
+        placed = False
+        x, y = int(prev_x), int(prev_y)
+        for attempt in range(18):
+            swing = (attempt // 2 + 1) * (0.28 if attempt % 2 == 0 else -0.28)
+            trial_angle = angle + swing
+            trial_x = int(np.clip(prev_x + distance * math.cos(trial_angle), 30, 482))
+            trial_y = int(np.clip(prev_y + distance * math.sin(trial_angle), 30, 354))
 
-        if strength > 0.83:
-            turn += direction * (0.25 if index % 2 == 0 else -0.25)
-        angle += turn
-
-        candidate_x = current_x
-        candidate_y = current_y
-        found = False
-        for attempt in range(20):
-            ring = attempt // 7
-            jitter_cycle = (0.0, 0.35, -0.35, 0.8, -0.8, 1.25, -1.25)
-            test_angle = angle + direction * jitter_cycle[attempt % len(jitter_cycle)] + ring * 0.2 * direction
-            step = jump * (1.0 + 0.08 * ring)
-            px = current_x + step * math.cos(test_angle)
-            py = current_y + step * math.sin(test_angle)
-
-            if px < min_x or px > max_x:
-                test_angle = math.pi - test_angle
-                px = clamp(current_x + step * math.cos(test_angle), min_x, max_x)
-            if py < min_y or py > max_y:
-                test_angle = -test_angle
-                py = clamp(current_y + step * math.sin(test_angle), min_y, max_y)
-
-            if hit_objects:
-                prev = hit_objects[-1]
-                dx = px - prev.x
-                dy = py - prev.y
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist < min_note_distance:
-                    continue
-
-            if is_too_linear(px, py):
+            if (trial_x, trial_y) in used_positions:
                 continue
-
-            candidate_x, candidate_y = px, py
-            angle = test_angle
-            found = True
+            if notes:
+                dx = trial_x - notes[-1].x
+                dy = trial_y - notes[-1].y
+                if math.hypot(dx, dy) < min_note_distance:
+                    continue
+            x, y = trial_x, trial_y
+            placed = True
             break
 
-        if not found:
-            # Fallback: orbit around center instead of extending a straight line.
-            orbit_angle = angle + direction * 1.2
-            candidate_x = clamp(256.0 + (jump * 0.85) * math.cos(orbit_angle), min_x, max_x)
-            candidate_y = clamp(192.0 + (jump * 0.85) * math.sin(orbit_angle), min_y, max_y)
-            angle = orbit_angle
+        if not placed:
+            x = int(np.clip(prev_x + distance * 0.7, 30, 482))
+            y = int(np.clip(prev_y + distance * 0.45, 30, 354))
+            if notes:
+                dx = x - notes[-1].x
+                dy = y - notes[-1].y
+                if math.hypot(dx, dy) < min_note_distance:
+                    x = int(np.clip(x + 24, 30, 482))
+                    y = int(np.clip(y + 24, 30, 354))
 
-        current_x, current_y = candidate_x, candidate_y
-        x = int(round(candidate_x))
-        y = int(round(candidate_y))
-        object_type = 5 if len(hit_objects) % 4 == 0 else 1
-        hit_sound = 4 if strength > 0.85 else 0
-        hit_sample = "0:0:0:0:"
-        line = f"{x},{y},{time_ms},{object_type},{hit_sound},{hit_sample}"
+        snap = "1/1" if prev_time_ms is None else _closest_snap(delta_ms, beat_ms, allowed_snaps)
+        notes.append(GeneratedNote(time_ms=time_ms, x=x, y=y, snap=snap))
+        used_positions.add((x, y))
+        prev_time_ms = time_ms
+        prev_x, prev_y = float(x), float(y)
+
+    if len(notes) < 2:
+        return notes, 0.0
+
+    spacings = []
+    for i in range(1, len(notes)):
+        spacings.append(math.hypot(notes[i].x - notes[i - 1].x, notes[i].y - notes[i - 1].y))
+    spacing_avg = float(np.mean(spacings)) if spacings else 0.0
+    spacing_norm = spacing_avg / 100.0
+    density = len(notes) / max(float(features["duration"]), 1.0)
+    ar_factor = float(profile["ar"]) / 10.0
+    estimated_sr = float((density * spacing_norm * (1.2 + ar_factor)) / 2.6)
+    return notes, estimated_sr
+
+
+def _calibrate_profile_to_target(
+    features: dict[str, object], base_profile: dict[str, object]
+) -> tuple[list[GeneratedNote], float, dict[str, object]]:
+    profile = dict(base_profile)
+    notes: list[GeneratedNote] = []
+    sr_est = 0.0
+    for _ in range(8):
+        notes, sr_est = _generate_notes_for_profile(features, profile)
+        if sr_est > float(profile["star_max"]) + 0.5:
+            profile["threshold"] = min(0.92, float(profile["threshold"]) + 0.04)
+            profile["spacing_mult"] = float(profile["spacing_mult"]) * 0.92
+        elif sr_est < float(profile["star_min"]) - 0.5:
+            profile["threshold"] = max(0.1, float(profile["threshold"]) - 0.04)
+            profile["spacing_mult"] = float(profile["spacing_mult"]) * 1.08
+        else:
+            break
+
+    sr_est = max(float(profile["star_min"]) - 0.5, min(float(profile["star_max"]) + 0.5, sr_est))
+    return notes, sr_est, profile
+
+
+def _note_type_for_onset(features: dict[str, object], note: GeneratedNote) -> tuple[int, float]:
+    bass = features["bass_energy"]
+    high = features["high_energy"]
+    sr = int(features["sr"])
+
+    bass_val = _sample_frame_feature(bass, note.time_ms / 1000.0, sr)
+    high_val = _sample_frame_feature(high, note.time_ms / 1000.0, sr)
+    high_ratio = high_val / (bass_val + high_val + 1e-6)
+
+    if high_ratio > 0.62:
+        return 2, high_ratio
+    return 1, high_ratio
+
+
+def _build_hit_objects(
+    notes: list[GeneratedNote],
+    features: dict[str, object],
+    profile: dict[str, object],
+) -> list[HitObject]:
+    hit_objects: list[HitObject] = []
+
+    for idx, note in enumerate(notes):
+        object_type, high_ratio = _note_type_for_onset(features, note)
+        hit_sound = 4 if high_ratio < 0.22 else 0
+
+        if object_type == 2 and idx + 1 < len(notes):
+            next_note = notes[idx + 1]
+            dx = next_note.x - note.x
+            dy = next_note.y - note.y
+            seg_distance = max(30.0, min(240.0, math.hypot(dx, dy) * 0.9))
+            ctrl_x = int(np.clip(note.x + dx * 0.55, 30, 482))
+            ctrl_y = int(np.clip(note.y + dy * 0.55, 30, 354))
+            slider_length = max(80.0, seg_distance * float(profile["sv"]))
+            object_line = (
+                f"{note.x},{note.y},{note.time_ms},2,{hit_sound},"
+                f"B|{ctrl_x}:{ctrl_y}|{next_note.x}:{next_note.y},1,{slider_length:.2f},0:0|0:0,0:0:0:0:"
+            )
+        else:
+            object_type = 1
+            object_line = f"{note.x},{note.y},{note.time_ms},1,{hit_sound},0:0:0:0:"
 
         hit_objects.append(
             HitObject(
-                x=x,
-                y=y,
-                time=time_ms,
+                x=note.x,
+                y=note.y,
+                time=note.time_ms,
                 object_type=object_type,
                 hit_sound=hit_sound,
-                hit_sample=hit_sample,
-                line=line,
+                hit_sample="0:0:0:0:",
+                line=object_line,
             )
         )
-        last_time = time_ms
 
     if not hit_objects:
-        first_time = int(round(beats[0] * 1000))
-        line = f"256,192,{first_time},1,0,0:0:0:0:"
+        line = "256,192,0,1,0,0:0:0:0:"
         hit_objects.append(
             HitObject(
                 x=256,
                 y=192,
-                time=first_time,
+                time=0,
                 object_type=1,
                 hit_sound=0,
                 hit_sample="0:0:0:0:",
@@ -444,55 +647,67 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     return hit_objects
 
 
-@app.post("/analyze/bpm", response_model=BpmAnalysisResponse)
-@app.post("/api/analyze/bpm", response_model=BpmAnalysisResponse)
-async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
+def _build_timing_from_features(
+    features: dict[str, object],
+    meter: int,
+    sample_set: int,
+    sample_index: int,
+    volume: int,
+    effects: int,
+) -> list[TimingPoint]:
+    beat_times = [float(v) for v in features["beat_times"] if v >= 0]
+    if not beat_times:
+        beat_times = [float(v) for v in features["onset_times"][:32] if v >= 0]
+
+    request = TimingPointRequest(
+        bpm=float(features["tempo"]),
+        beats=beat_times,
+        meter=meter,
+        sample_set=sample_set,
+        sample_index=sample_index,
+        volume=volume,
+        effects=effects,
+    )
+    return _generate_uninherited_points(request)
+
+
+def _extract_audio_to_temp(audio: UploadFile) -> tuple[Path, str]:
     suffix = Path(audio.filename or "track.mp3").suffix.lower()
     if suffix not in {".mp3", ".flac"}:
         raise HTTPException(status_code=400, detail="only .mp3 and .flac are supported")
 
-    payload = await audio.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="empty file")
+    fd, temp_name = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return Path(temp_name), suffix
 
-    temp_path: Path | None = None
+
+@app.post("/analyze/bpm", response_model=BpmAnalysisResponse)
+@app.post("/api/analyze/bpm", response_model=BpmAnalysisResponse)
+async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
+    temp_path, _ = _extract_audio_to_temp(audio)
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            handle.write(payload)
-            temp_path = Path(handle.name)
+        payload = await audio.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="empty file")
+        temp_path.write_bytes(payload)
 
-        signal, sample_rate = librosa.load(temp_path.as_posix(), sr=None, mono=True)
-        onset_env = librosa.onset.onset_strength(y=signal, sr=sample_rate)
-        tempo, beat_frames = librosa.beat.beat_track(
-            onset_envelope=onset_env, sr=sample_rate, units="frames"
-        )
-        beat_times = librosa.frames_to_time(beat_frames, sr=sample_rate).tolist()
-        duration = librosa.get_duration(y=signal, sr=sample_rate)
-        centroids = librosa.feature.spectral_centroid(y=signal, sr=sample_rate)[0]
-
-        beat_strengths: list[float] = []
-        beat_centroids: list[float] = []
-        for frame in beat_frames:
-            frame_index = int(frame)
-            strength = float(onset_env[frame_index]) if frame_index < len(onset_env) else 0.0
-            centroid = float(centroids[frame_index]) if frame_index < len(centroids) else 0.0
-            beat_strengths.append(strength)
-            beat_centroids.append(centroid)
-
-        bpm_value = float(tempo[0] if hasattr(tempo, "__len__") else tempo)
+        features = _analyze_audio_librosa(temp_path)
+        beat_times = [round(float(value), 4) for value in features["onset_times"]]
         return BpmAnalysisResponse(
-            bpm=round(bpm_value, 3),
-            beats=[round(float(time), 4) for time in beat_times],
+            bpm=round(float(features["tempo"]), 3),
+            beats=beat_times,
             beat_count=len(beat_times),
-            duration_sec=round(float(duration), 4),
-            beat_strengths=[round(value, 6) for value in beat_strengths],
-            beat_centroids=[round(value, 4) for value in beat_centroids],
+            duration_sec=round(float(features["duration"]), 4),
+            beat_strengths=[round(float(v), 6) for v in features["beat_strengths"]],
+            beat_centroids=[round(float(v), 4) for v in features["beat_centroids"]],
+            timing_beats=[round(float(v), 4) for v in features["beat_times"]],
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"bpm analysis failed: {exc}") from exc
     finally:
-        if temp_path and temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
 
 
 @app.post("/generate/timing-points", response_model=TimingPointResponse)
@@ -505,6 +720,158 @@ def generate_timing_points(payload: TimingPointRequest) -> TimingPointResponse:
 @app.post("/generate/hit-objects", response_model=HitObjectResponse)
 @app.post("/api/generate/hit-objects", response_model=HitObjectResponse)
 def generate_hit_objects(payload: HitObjectRequest) -> HitObjectResponse:
-    hit_objects = _generate_hit_objects(payload)
+    star_target = min(max(payload.difficulty_star, 1.0), 7.0)
+    label, profile = _resolve_profile(None, star_target)
+
+    tempo = 120.0
+    beat_step = 60.0 / tempo
+    onsets = np.array(payload.beats, dtype=np.float32)
+    if onsets.size == 0:
+        raise HTTPException(status_code=400, detail="beats cannot be empty")
+
+    features: dict[str, object] = {
+        "onset_times": onsets,
+        "spectral_flux": np.array(payload.beat_strengths if payload.beat_strengths else [1.0] * len(onsets), dtype=np.float32),
+        "rms": np.array(payload.beat_strengths if payload.beat_strengths else [1.0] * len(onsets), dtype=np.float32),
+        "bass_energy": np.array([1.0] * len(onsets), dtype=np.float32),
+        "mid_energy": np.array([1.0] * len(onsets), dtype=np.float32),
+        "high_energy": np.array(payload.beat_centroids if payload.beat_centroids else [0.5] * len(onsets), dtype=np.float32),
+        "sr": 22050,
+        "tempo": tempo,
+        "beat_times": np.arange(0, max(onsets[-1] + beat_step, beat_step), beat_step),
+        "duration": float(max(onsets[-1], 1.0)),
+    }
+
+    notes, _, tuned = _calibrate_profile_to_target(features, profile)
+    notes = _thin_notes(notes, min(max(payload.max_notes, 1), 2000))
+    hit_objects = _build_hit_objects(notes, features, tuned)
+    if label and payload.difficulty_star <= 3.5:
+        hit_objects = hit_objects
     return HitObjectResponse(hit_objects=hit_objects)
 
+
+@app.post("/generate/difficulties-json", response_model=DifficultyGenerateResponse)
+@app.post("/api/generate/difficulties-json", response_model=DifficultyGenerateResponse)
+async def generate_difficulties_json(
+    audio: UploadFile = File(...),
+    difficulties: str = Form("Easy,Normal,Hard,Insane"),
+    max_notes: int = Form(1200),
+) -> DifficultyGenerateResponse:
+    temp_path, _ = _extract_audio_to_temp(audio)
+    try:
+        payload = await audio.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="empty file")
+        temp_path.write_bytes(payload)
+
+        features = _analyze_audio_librosa(temp_path)
+        labels = [item.strip().capitalize() for item in difficulties.split(",") if item.strip()]
+        if not labels:
+            labels = ["Easy", "Normal", "Hard", "Insane"]
+
+        generated: list[GeneratedDifficulty] = []
+        for label in labels:
+            if label not in DIFF_PROFILES:
+                continue
+            notes, sr_est, _ = _calibrate_profile_to_target(features, dict(DIFF_PROFILES[label]))
+            notes = _thin_notes(notes, max(100, min(max_notes, 4000)))
+            spacing_msg = (
+                "spacing follows onset intensity and rhythmic delta; "
+                "higher-energy onsets produce larger jumps, quieter sections tighten spacing"
+            )
+            generated.append(
+                GeneratedDifficulty(
+                    difficulty=label,
+                    star_rating=round(sr_est, 2),
+                    notes=notes,
+                    spacing_notes=spacing_msg,
+                )
+            )
+
+        if not generated:
+            raise HTTPException(status_code=400, detail="no valid difficulties requested")
+
+        return DifficultyGenerateResponse(generated=generated)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"difficulty generation failed: {exc}") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@app.post("/generate/full-map", response_model=FullGenerationResponse)
+@app.post("/api/generate/full-map", response_model=FullGenerationResponse)
+async def generate_full_map(
+    audio: UploadFile = File(...),
+    difficulty_star: float = Form(3.0),
+    difficulty_label: str | None = Form(None),
+    max_notes: int = Form(1200),
+    meter: int = Form(4),
+    sample_set: int = Form(1),
+    sample_index: int = Form(0),
+    volume: int = Form(70),
+    effects: int = Form(0),
+) -> FullGenerationResponse:
+    temp_path, _ = _extract_audio_to_temp(audio)
+    try:
+        payload = await audio.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="empty file")
+        temp_path.write_bytes(payload)
+
+        features = _analyze_audio_librosa(temp_path)
+        star_target = min(max(float(difficulty_star), 1.0), 7.0)
+        label, base_profile = _resolve_profile(difficulty_label, star_target)
+
+        notes, sr_est, tuned_profile = _calibrate_profile_to_target(features, base_profile)
+        notes = _thin_notes(notes, max(50, min(max_notes, 4000)))
+        hit_objects = _build_hit_objects(notes, features, tuned_profile)
+        timing_points = _build_timing_from_features(
+            features,
+            meter=max(1, meter),
+            sample_set=min(max(sample_set, 0), 3),
+            sample_index=max(sample_index, 0),
+            volume=min(max(volume, 0), 100),
+            effects=min(max(effects, 0), 1),
+        )
+
+        if timing_points and hit_objects and timing_points[0].time > hit_objects[0].time:
+            first = timing_points[0]
+            start = float(hit_objects[0].time)
+            first.line = _format_timing_line(
+                start,
+                first.beat_length,
+                first.meter,
+                first.sample_set,
+                first.sample_index,
+                first.volume,
+                first.effects,
+            )
+            first.time = round(start, 3)
+
+        settings = DifficultySettings(
+            difficulty=label,
+            target_star=round(star_target, 2),
+            estimated_star=round(sr_est, 2),
+            circle_size=round(float(tuned_profile["cs"]), 2),
+            approach_rate=round(float(tuned_profile["ar"]), 2),
+            overall_difficulty=round(float(tuned_profile["od"]), 2),
+            hp_drain=round(float(tuned_profile["hp"]), 2),
+            slider_multiplier=round(float(tuned_profile["sv"]), 2),
+        )
+
+        return FullGenerationResponse(
+            bpm=round(float(features["tempo"]), 3),
+            beat_count=len(notes),
+            duration_sec=round(float(features["duration"]), 4),
+            timing_points=timing_points,
+            hit_objects=hit_objects,
+            settings=settings,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"full map generation failed: {exc}") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
