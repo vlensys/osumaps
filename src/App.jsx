@@ -6,7 +6,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const emptyMetadata = {
   title: "",
   artist: "",
-  creator: "",
+  creator: "osumaps",
   version: "normal",
   source: "",
   tags: ""
@@ -52,6 +52,127 @@ function cleanField(value, fallback = "") {
 function sanitizeFilenamePart(value, fallback) {
   const normalized = cleanField(value, fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
   return normalized || fallback;
+}
+
+function movingAverage(values, windowSize) {
+  const output = new Array(values.length).fill(0);
+  let sum = 0;
+  for (let i = 0; i < values.length; i += 1) {
+    sum += values[i];
+    if (i >= windowSize) sum -= values[i - windowSize];
+    const divisor = i < windowSize ? i + 1 : windowSize;
+    output[i] = sum / divisor;
+  }
+  return output;
+}
+
+function findMaxIndex(values, endExclusive = values.length) {
+  let bestIndex = 0;
+  let bestValue = Number.NEGATIVE_INFINITY;
+  const end = Math.max(1, Math.min(endExclusive, values.length));
+  for (let i = 0; i < end; i += 1) {
+    if (values[i] > bestValue) {
+      bestValue = values[i];
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+async function analyzeAudioClientSide(file) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) throw new Error("web audio api is not available in this browser");
+
+  const context = new AudioCtx();
+  try {
+    const input = await file.arrayBuffer();
+    const decoded = await context.decodeAudioData(input.slice(0));
+    const sampleRate = decoded.sampleRate;
+    const channelCount = decoded.numberOfChannels;
+    const sampleCount = decoded.length;
+    const durationSec = decoded.duration;
+
+    if (sampleCount < 2048) throw new Error("audio is too short for analysis");
+
+    const mono = new Float32Array(sampleCount);
+    for (let ch = 0; ch < channelCount; ch += 1) {
+      const channel = decoded.getChannelData(ch);
+      for (let i = 0; i < sampleCount; i += 1) mono[i] += channel[i] / channelCount;
+    }
+
+    const frameSize = 1024;
+    const hopSize = 512;
+    const frameCount = Math.max(1, Math.floor((sampleCount - frameSize) / hopSize) + 1);
+    const energy = new Array(frameCount).fill(0);
+    const zcr = new Array(frameCount).fill(0);
+
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      const start = frame * hopSize;
+      let sumSquares = 0;
+      let zeroCrossings = 0;
+      let prev = mono[start];
+      for (let i = 0; i < frameSize; i += 1) {
+        const sample = mono[start + i] ?? 0;
+        sumSquares += sample * sample;
+        if (i > 0 && ((sample >= 0 && prev < 0) || (sample < 0 && prev >= 0))) zeroCrossings += 1;
+        prev = sample;
+      }
+      energy[frame] = Math.sqrt(sumSquares / frameSize);
+      zcr[frame] = zeroCrossings / frameSize;
+    }
+
+    const onset = new Array(frameCount).fill(0);
+    for (let i = 1; i < frameCount; i += 1) onset[i] = Math.max(0, energy[i] - energy[i - 1]);
+    const onsetSmoothed = movingAverage(onset, 4);
+
+    const framesPerSecond = sampleRate / hopSize;
+    const minBpm = 60;
+    const maxBpm = 220;
+    const minLag = Math.max(1, Math.round((framesPerSecond * 60) / maxBpm));
+    const maxLag = Math.max(minLag + 1, Math.round((framesPerSecond * 60) / minBpm));
+
+    let bestLag = Math.round((framesPerSecond * 60) / 120);
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (let lag = minLag; lag <= maxLag; lag += 1) {
+      let score = 0;
+      for (let i = lag; i < onsetSmoothed.length; i += 1) score += onsetSmoothed[i] * onsetSmoothed[i - lag];
+      if (score > bestScore) {
+        bestScore = score;
+        bestLag = lag;
+      }
+    }
+
+    const bpm = (60 * framesPerSecond) / bestLag;
+    const beatStepSec = 60 / Math.max(1, bpm);
+    const searchFrames = Math.min(frameCount, Math.round(framesPerSecond * 8));
+    const firstBeatFrame = findMaxIndex(onsetSmoothed, searchFrames);
+    const firstBeatSec = (firstBeatFrame * hopSize) / sampleRate;
+
+    const beats = [];
+    for (let t = firstBeatSec; t < durationSec; t += beatStepSec) beats.push(t);
+    for (let t = firstBeatSec - beatStepSec; t > 0; t -= beatStepSec) beats.unshift(t);
+
+    const beatStrengths = beats.map((beatSec) => {
+      const frame = Math.min(frameCount - 1, Math.max(0, Math.round((beatSec * sampleRate) / hopSize)));
+      return onsetSmoothed[frame] ?? 0;
+    });
+
+    const beatCentroids = beats.map((beatSec) => {
+      const frame = Math.min(frameCount - 1, Math.max(0, Math.round((beatSec * sampleRate) / hopSize)));
+      return zcr[frame] ?? 0;
+    });
+
+    return {
+      bpm: Number(bpm.toFixed(3)),
+      beats: beats.map((value) => Number(value.toFixed(4))),
+      beat_count: beats.length,
+      duration_sec: Number(durationSec.toFixed(4)),
+      beat_strengths: beatStrengths.map((value) => Number(value.toFixed(6))),
+      beat_centroids: beatCentroids.map((value) => Number(value.toFixed(6)))
+    };
+  } finally {
+    await context.close();
+  }
 }
 
 function buildOsuContent({ metadata, audioFilename, timingPointLines, hitObjectLines }) {
@@ -298,21 +419,8 @@ export default function App() {
     setIsAnalyzing(true);
     setAnalysisError("");
 
-    const formData = new FormData();
-    formData.append("audio", audioFile);
-
     try {
-      const response = await fetch(`${API_BASE}/analyze/bpm`, {
-        method: "POST",
-        body: formData
-      });
-
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => null);
-        throw new Error(errorPayload?.detail || "analysis request failed");
-      }
-
-      const payload = await response.json();
+      const payload = await analyzeAudioClientSide(audioFile);
       setAnalysis(payload);
       setNotesError("");
       setHitObjects([]);

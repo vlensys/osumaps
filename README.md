@@ -1,71 +1,41 @@
-# osumaps
+﻿# osumaps
 
-audio-to-osu! lazer map converter web app.
+audio to osu! lazer map converter.
 
-## stack
+## live app
 
-- frontend: react + tailwind (vite)
-- backend: python + fastapi + librosa
-- hosting plan: github pages for frontend, vercel fallback for backend api if needed
+- frontend: `https://vlensys.github.io/osumaps/`
+- backend api: `https://osumaps.vercel.app/api/health`
 
-## local run
+## how to use
 
-```bash
-npm install
-npm run dev
-```
+1. open the app and upload an `.mp3` or `.flac` file.
+2. edit metadata fields on the right (title, artist, creator, difficulty name).
+3. click `run full pipeline`.
+4. check `sanity status`.
+5. click `export .osu`.
+6. place the exported `.osu` in the same folder as the audio file.
+7. import the folder in osu! lazer.
 
-frontend env:
+## manual buttons (optional)
 
-```bash
-cp .env.example .env
-```
+- `analyze bpm`: local, browser-side BPM/beat detection (audio does not upload).
+- `generate timing points`: sends beat data to API and builds `[TimingPoints]`.
+- `generate note pattern`: sends beat features to API and builds `[HitObjects]`.
+- `run beatmap sanity check`: validates common format mistakes.
 
-set `VITE_API_BASE`:
-- local backend: `http://127.0.0.1:8000`
-- deployed backend (vercel): `https://<your-vercel-project>.vercel.app/api`
+## troubleshooting
 
-backend:
+- `networkerror` / `cors` on analyze:
+  - fixed by local analysis in browser. no audio upload for BPM step.
+- `413` request entity too large:
+  - avoided for analyze step, because BPM is client-side.
+- `ses removing unpermitted intrinsics` logs:
+  - these logs are from browser extension sandboxing (not from this app code).
+- if API calls fail for timing/note generation:
+  - verify `https://osumaps.vercel.app/api/health` returns `{ "status": "ok" }`.
 
-```bash
-cd backend
-python -m venv .venv
-.venv\\Scripts\\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
+## notes
 
-## deploy
-
-frontend (github pages first):
-- workflow file: `.github/workflows/deploy-pages.yml`
-- on push to `master`, it builds and deploys `dist/` to pages
-- keep `vite.config.js` base as `/osumaps/`
-
-backend (vercel fallback):
-- config file: `vercel.json`
-- deploys `backend/main.py` as serverless python
-- exposed route pattern: `/api/*`
-
-## current progress
-
-1. audio upload (mp3/flac) with drag/drop
-2. local preview + metadata auto-fill from audio tags (fallback to filename)
-3. beat detection + bpm calculation via librosa endpoint (`POST /analyze/bpm`)
-4. timing point generation (`POST /generate/timing-points`)
-5. note pattern generation from audio features (`POST /generate/hit-objects`)
-6. `.osu` export from generated metadata + timing + hit objects
-7. playback sync verifier against generated hit object times
-8. in-app beatmap sanity check for common spec errors before lazer import
-9. one-click full pipeline button (analyze -> timing -> notes -> sanity check)
-
-## remaining before ship
-
-1. run one real `.mp3` and one `.flac` end-to-end
-2. import generated `.osu` into osu! lazer and pass validator
-3. tune hit object generation defaults after validator feedback
-4. resolve local git index lock/permission issue before normal commits
-
-qa checklist: `docs/qa-checklist.md`
-api qa runner: `npm run qa:api -- <mp3-file> <flac-file>`
-
+- generated maps are auto-mapped drafts. always playtest and adjust in lazer editor.
+- this project does not store uploaded audio.
