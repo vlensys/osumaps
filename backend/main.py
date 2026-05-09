@@ -491,6 +491,76 @@ def _compute_band_energies(
     return bass_energy, mid_energy, high_energy
 
 
+def _analyze_bpm_lightweight(path: Path) -> dict[str, object]:
+    sr_target = 12000
+    hop_length = 512
+    n_fft = 1024
+
+    print("[analyze-bpm-light] loading audio", flush=True)
+    y, sr = librosa.load(
+        path.as_posix(),
+        sr=sr_target,
+        mono=True,
+        dtype=np.float32,
+        duration=120.0,
+    )
+    if y.size == 0:
+        raise ValueError("decoded audio has no samples")
+
+    print("[analyze-bpm-light] onset envelope", flush=True)
+    onset_env = librosa.onset.onset_strength(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        n_fft=n_fft,
+    ).astype(np.float32, copy=False)
+
+    print("[analyze-bpm-light] onset detect", flush=True)
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop_length,
+        units="frames",
+        delta=0.04,
+        wait=max(1, int(0.02 * sr // hop_length)),
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+
+    print("[analyze-bpm-light] tempo", flush=True)
+    tempo_candidates = librosa.feature.tempo(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop_length,
+        aggregate=np.median,
+    )
+    tempo_value = float(tempo_candidates[0]) if len(tempo_candidates) else 120.0
+    tempo_value = max(1.0, tempo_value)
+
+    beat_strengths = [float(onset_env[min(max(int(f), 0), len(onset_env) - 1)]) for f in onset_frames]
+    if not beat_strengths:
+        beat_strengths = [0.0]
+
+    # lightweight high-frequency proxy for centroid-like info
+    zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop_length)[0].astype(np.float32, copy=False)
+    beat_centroids = [float(zcr[min(max(int(f), 0), len(zcr) - 1)]) for f in onset_frames]
+    if not beat_centroids:
+        beat_centroids = [0.0]
+
+    duration = float(librosa.get_duration(y=y, sr=sr))
+    beat_period = 60.0 / tempo_value
+    beat_start = float(onset_times[0]) if len(onset_times) else 0.0
+    timing_beats = np.arange(beat_start, max(duration, beat_start + beat_period), beat_period)
+
+    return {
+        "tempo": tempo_value,
+        "onset_times": onset_times,
+        "duration": duration,
+        "beat_strengths": beat_strengths,
+        "beat_centroids": beat_centroids,
+        "beat_times": timing_beats,
+    }
+
+
 def _merge_onset_frames(frames: np.ndarray, min_gap_frames: int) -> np.ndarray:
     if frames.size == 0:
         return frames
@@ -917,7 +987,7 @@ async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
         print(f"[analyze-bpm] upload bytes={len(payload)}", flush=True)
         temp_path.write_bytes(payload)
 
-        features = _analyze_audio_librosa(temp_path)
+        features = _analyze_bpm_lightweight(temp_path)
         beat_times = [round(float(value), 4) for value in features["onset_times"]]
         return BpmAnalysisResponse(
             bpm=round(float(features["tempo"]), 3),
