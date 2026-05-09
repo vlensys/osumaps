@@ -887,9 +887,15 @@ def _build_timing_from_features(
 
 
 def _extract_audio_to_temp(audio: UploadFile) -> tuple[Path, str]:
-    suffix = Path(audio.filename or "track.mp3").suffix.lower()
+    filename = (audio.filename or "").strip()
+    suffix = Path(filename).suffix.lower()
+
     if suffix not in {".mp3", ".flac"}:
-        raise HTTPException(status_code=400, detail="only .mp3 and .flac are supported")
+        content_type = (audio.content_type or "").lower()
+        if "flac" in content_type:
+            suffix = ".flac"
+        else:
+            suffix = ".mp3"
 
     fd, temp_name = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
@@ -901,9 +907,14 @@ def _extract_audio_to_temp(audio: UploadFile) -> tuple[Path, str]:
 async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
     temp_path, _ = _extract_audio_to_temp(audio)
     try:
+        print(
+            f"[analyze-bpm] filename={audio.filename!r} content_type={audio.content_type!r}",
+            flush=True,
+        )
         payload = await audio.read()
         if not payload:
             raise HTTPException(status_code=400, detail="empty file")
+        print(f"[analyze-bpm] upload bytes={len(payload)}", flush=True)
         temp_path.write_bytes(payload)
 
         features = _analyze_audio_librosa(temp_path)
