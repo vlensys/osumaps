@@ -54,6 +54,119 @@ function sanitizeFilenamePart(value, fallback) {
   return normalized || fallback;
 }
 
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let j = 0; j < 8; j += 1) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function msDosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = date.getHours();
+  const minutes = date.getMinutes();
+  const seconds = Math.floor(date.getSeconds() / 2);
+  const dosTime = (hours << 11) | (minutes << 5) | seconds;
+  const dosDate = ((year - 1980) << 9) | (month << 5) | day;
+  return { dosTime, dosDate };
+}
+
+function writeU16(view, offset, value) {
+  view.setUint16(offset, value, true);
+}
+
+function writeU32(view, offset, value) {
+  view.setUint32(offset, value >>> 0, true);
+}
+
+function buildZipStore(entries) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  const centralRecords = [];
+  let offset = 0;
+  const { dosTime, dosDate } = msDosDateTime();
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const data = entry.data;
+    const checksum = crc32(data);
+    const size = data.length;
+
+    const local = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(local.buffer);
+    writeU32(localView, 0, 0x04034b50);
+    writeU16(localView, 4, 20);
+    writeU16(localView, 6, 0);
+    writeU16(localView, 8, 0);
+    writeU16(localView, 10, dosTime);
+    writeU16(localView, 12, dosDate);
+    writeU32(localView, 14, checksum);
+    writeU32(localView, 18, size);
+    writeU32(localView, 22, size);
+    writeU16(localView, 26, nameBytes.length);
+    writeU16(localView, 28, 0);
+    local.set(nameBytes, 30);
+    chunks.push(local, data);
+
+    const central = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(central.buffer);
+    writeU32(centralView, 0, 0x02014b50);
+    writeU16(centralView, 4, 20);
+    writeU16(centralView, 6, 20);
+    writeU16(centralView, 8, 0);
+    writeU16(centralView, 10, 0);
+    writeU16(centralView, 12, dosTime);
+    writeU16(centralView, 14, dosDate);
+    writeU32(centralView, 16, checksum);
+    writeU32(centralView, 20, size);
+    writeU32(centralView, 24, size);
+    writeU16(centralView, 28, nameBytes.length);
+    writeU16(centralView, 30, 0);
+    writeU16(centralView, 32, 0);
+    writeU16(centralView, 34, 0);
+    writeU16(centralView, 36, 0);
+    writeU32(centralView, 38, 0);
+    writeU32(centralView, 42, offset);
+    central.set(nameBytes, 46);
+
+    centralRecords.push(central);
+    offset += local.length + data.length;
+  }
+
+  const centralStart = offset;
+  let centralSize = 0;
+  for (const record of centralRecords) {
+    chunks.push(record);
+    centralSize += record.length;
+    offset += record.length;
+  }
+
+  const eocd = new Uint8Array(22);
+  const eocdView = new DataView(eocd.buffer);
+  writeU32(eocdView, 0, 0x06054b50);
+  writeU16(eocdView, 4, 0);
+  writeU16(eocdView, 6, 0);
+  writeU16(eocdView, 8, centralRecords.length);
+  writeU16(eocdView, 10, centralRecords.length);
+  writeU32(eocdView, 12, centralSize);
+  writeU32(eocdView, 16, centralStart);
+  writeU16(eocdView, 20, 0);
+  chunks.push(eocd);
+
+  return new Blob(chunks, { type: "application/zip" });
+}
+
 function movingAverage(values, windowSize) {
   const output = new Array(values.length).fill(0);
   let sum = 0;
@@ -270,7 +383,7 @@ function validateBeatmapDraft({ metadata, timingPoints, hitObjects }) {
 
   const firstHitTime = hitObjects.length > 0 ? hitObjects[0].time : null;
   const firstTimingTime = timingPoints.length > 0 ? timingPoints[0].time : null;
-  if (firstHitTime !== null && firstTimingTime !== null && firstTimingTime > firstHitTime) {
+  if (firstHitTime !== null && firstTimingTime !== null && firstTimingTime - firstHitTime > 2) {
     issues.push("first timing point starts after first hit object");
   }
 
@@ -278,6 +391,25 @@ function validateBeatmapDraft({ metadata, timingPoints, hitObjects }) {
     ok: issues.length === 0,
     issues
   };
+}
+
+function ensureTimingStartsBeforeHits(timingPoints, hitObjects) {
+  if (!timingPoints.length || !hitObjects.length) return timingPoints;
+  const firstTiming = timingPoints[0];
+  const firstHit = hitObjects[0];
+
+  if ((firstTiming.time ?? 0) <= firstHit.time + 2) return timingPoints;
+
+  const fixedTime = Number(firstHit.time.toFixed ? firstHit.time.toFixed(3) : firstHit.time);
+  const fixedLine = `${fixedTime.toFixed(3)},${Number(firstTiming.beat_length).toFixed(6)},${firstTiming.meter},${firstTiming.sample_set},${firstTiming.sample_index},${firstTiming.volume},1,${firstTiming.effects}`;
+
+  const prepended = {
+    ...firstTiming,
+    time: fixedTime,
+    line: fixedLine
+  };
+
+  return [prepended, ...timingPoints];
 }
 
 export default function App() {
@@ -463,11 +595,12 @@ export default function App() {
       }
 
       const payload = await response.json();
-      setTimingPoints(payload.timing_points ?? []);
+      const normalized = ensureTimingStartsBeforeHits(payload.timing_points ?? [], hitObjects);
+      setTimingPoints(normalized);
       setNotesError("");
       setHitObjects([]);
       setValidationResult(null);
-      return payload.timing_points ?? [];
+      return normalized;
     } catch (error) {
       setTimingError(error.message || "timing point generation failed");
       setTimingPoints([]);
@@ -540,16 +673,19 @@ export default function App() {
       return;
     }
 
+    const fixedTiming = ensureTimingStartsBeforeHits(generatedTiming, generatedNotes);
+    if (fixedTiming !== generatedTiming) setTimingPoints(fixedTiming);
+
     const result = validateBeatmapDraft({
       metadata,
-      timingPoints: generatedTiming,
+      timingPoints: fixedTiming,
       hitObjects: generatedNotes
     });
     setValidationResult(result);
     setIsRunningPipeline(false);
   };
 
-  const exportOsuFile = () => {
+  const exportOszFile = async () => {
     if (!audioFile) {
       setExportError("upload an audio file before exporting");
       return;
@@ -574,13 +710,20 @@ export default function App() {
     const titlePart = sanitizeFilenamePart(metadata.title, "untitled");
     const creatorPart = sanitizeFilenamePart(metadata.creator, "osumaps");
     const versionPart = sanitizeFilenamePart(metadata.version, "generated");
-    const fileName = `${artistPart} - ${titlePart} (${creatorPart}) [${versionPart}].osu`;
+    const osuFileName = `${artistPart} - ${titlePart} (${creatorPart}) [${versionPart}].osu`;
+    const packageName = `${artistPart} - ${titlePart}.osz`;
 
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const encoder = new TextEncoder();
+    const osuBytes = encoder.encode(content);
+    const audioBytes = new Uint8Array(await audioFile.arrayBuffer());
+    const blob = buildZipStore([
+      { name: osuFileName, data: osuBytes },
+      { name: audioFile.name, data: audioBytes }
+    ]);
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = fileName;
+    anchor.download = packageName;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
@@ -715,10 +858,10 @@ export default function App() {
             )}
             <button
               type="button"
-              onClick={exportOsuFile}
+              onClick={exportOszFile}
               className="mt-3 rounded-lg bg-cyan-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-200"
             >
-              export .osu
+              export .osz
             </button>
             {exportError && <p className="mt-2 text-sm text-rose-300">{exportError}</p>}
             <button

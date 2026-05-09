@@ -13,9 +13,8 @@ audio to osu! lazer map converter.
 2. edit metadata fields on the right (title, artist, creator, difficulty name).
 3. click `run full pipeline`.
 4. check `sanity status`.
-5. click `export .osu`.
-6. place the exported `.osu` in the same folder as the audio file.
-7. import the folder in osu! lazer.
+5. click `export .osz`.
+6. import the exported `.osz` package in osu! lazer.
 
 ## manual buttons (optional)
 
