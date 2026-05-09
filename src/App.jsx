@@ -7,7 +7,7 @@ const API_BASE =
   (typeof window !== "undefined" &&
   window.location.hostname !== "localhost" &&
   window.location.hostname !== "127.0.0.1"
-    ? "https://osumaps.vercel.app/api"
+    ? "https://osumaps.onrender.com/api"
     : "http://127.0.0.1:8000");
 
 const emptyMetadata = {
@@ -82,10 +82,6 @@ function difficultyFromStars(star) {
   if (star < 4) return "Hard";
   if (star < 5.5) return "Insane";
   return "Expert";
-}
-
-function isVercelApi(base) {
-  return typeof base === "string" && base.includes("vercel.app");
 }
 
 const CRC_TABLE = (() => {
@@ -544,20 +540,10 @@ export default function App() {
     formData.append("volume", String(mapSettings.timingVolume));
     formData.append("effects", String(mapSettings.effects));
 
-    let response;
-    try {
-      response = await fetch(`${API_BASE}/generate/full-map`, {
-        method: "POST",
-        body: formData
-      });
-    } catch (error) {
-      if (isVercelApi(API_BASE) && audioFile.size > 4.5 * MB) {
-        throw new Error(
-          "hosted backend rejected upload (vercel request limit). your app limit is 100 mb, but this host cannot process this file size."
-        );
-      }
-      throw error;
-    }
+    const response = await fetch(`${API_BASE}/generate/full-map`, {
+      method: "POST",
+      body: formData
+    });
     if (!response.ok) {
       const errorPayload = await response.json().catch(() => null);
       const detail = errorPayload?.detail || "full pipeline request failed";

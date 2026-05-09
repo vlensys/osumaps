@@ -5,7 +5,7 @@ audio to osu! lazer map converter.
 ## live app
 
 - frontend: `https://vlensys.github.io/osumaps/`
-- backend api: `https://osumaps.vercel.app/api/health`
+- backend api: `https://osumaps.onrender.com/api/health`
 
 ## how to use
 
@@ -43,9 +43,7 @@ audio to osu! lazer map converter.
 ## troubleshooting lol
 
 - `networkerror` / API failures:
-  - verify backend health at `https://osumaps.vercel.app/api/health`.
-- `413` on hosted backend:
-  - file is too large for current hosted request limits; try a smaller file or run backend locally.
+  - verify backend health at `https://osumaps.onrender.com/api/health`.
 - `ses removing unpermitted intrinsics` logs:
   - from browser extension sandboxing, not this app.
 
