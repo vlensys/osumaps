@@ -40,7 +40,7 @@ audio to osu! lazer map converter.
   - `ApproachRate`
   - `SliderMultiplier`
 
-## troubleshooting
+## troubleshooting lol
 
 - `networkerror` / API failures:
   - verify backend health at `https://osumaps.vercel.app/api/health`.
