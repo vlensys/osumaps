@@ -25,6 +25,8 @@ class BpmAnalysisResponse(BaseModel):
     beats: list[float]
     beat_count: int
     duration_sec: float
+    beat_strengths: list[float]
+    beat_centroids: list[float]
 
 
 class TimingPoint(BaseModel):
@@ -51,6 +53,28 @@ class TimingPointRequest(BaseModel):
 
 class TimingPointResponse(BaseModel):
     timing_points: list[TimingPoint]
+
+
+class HitObject(BaseModel):
+    x: int
+    y: int
+    time: int
+    object_type: int
+    hit_sound: int
+    hit_sample: str
+    line: str
+
+
+class HitObjectRequest(BaseModel):
+    beats: list[float]
+    beat_strengths: list[float] = []
+    beat_centroids: list[float] = []
+    max_notes: int = 400
+    density: float = 0.75
+
+
+class HitObjectResponse(BaseModel):
+    hit_objects: list[HitObject]
 
 
 @app.get("/health")
@@ -192,6 +216,93 @@ def _generate_uninherited_points(payload: TimingPointRequest) -> list[TimingPoin
     return timing_points
 
 
+def _normalize(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    minimum = min(values)
+    maximum = max(values)
+    if maximum <= minimum:
+        return [0.5 for _ in values]
+    scale = maximum - minimum
+    return [(value - minimum) / scale for value in values]
+
+
+def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
+    beats = [float(value) for value in payload.beats if value >= 0]
+    if not beats:
+        raise HTTPException(status_code=400, detail="beats cannot be empty")
+
+    max_notes = min(max(payload.max_notes, 1), 2000)
+    density = min(max(payload.density, 0.1), 1.0)
+
+    strength_values = payload.beat_strengths[: len(beats)] if payload.beat_strengths else [1.0] * len(beats)
+    centroid_values = payload.beat_centroids[: len(beats)] if payload.beat_centroids else [0.0] * len(beats)
+
+    normalized_strengths = _normalize([float(value) for value in strength_values])
+    normalized_centroids = _normalize([float(value) for value in centroid_values])
+    if not normalized_centroids:
+        normalized_centroids = [0.5] * len(beats)
+
+    sorted_strengths = sorted(normalized_strengths)
+    quantile_index = int((1.0 - density) * (len(sorted_strengths) - 1))
+    threshold = sorted_strengths[quantile_index] if sorted_strengths else 0.0
+
+    hit_objects: list[HitObject] = []
+    last_time = -10_000
+
+    for index, beat_sec in enumerate(beats):
+        if len(hit_objects) >= max_notes:
+            break
+        strength = normalized_strengths[index] if index < len(normalized_strengths) else 0.5
+        centroid = normalized_centroids[index] if index < len(normalized_centroids) else 0.5
+
+        # Drop lower-energy beats to prevent overmapping.
+        if strength < threshold and index % 2 == 1:
+            continue
+
+        time_ms = int(round(beat_sec * 1000))
+        if time_ms - last_time < 70:
+            continue
+
+        x = int(round(64 + centroid * 384))
+        x = min(max(x, 0), 512)
+        y = 192
+        object_type = 5 if len(hit_objects) % 4 == 0 else 1
+        hit_sound = 4 if strength > 0.85 else 0
+        hit_sample = "0:0:0:0:"
+        line = f"{x},{y},{time_ms},{object_type},{hit_sound},{hit_sample}"
+
+        hit_objects.append(
+            HitObject(
+                x=x,
+                y=y,
+                time=time_ms,
+                object_type=object_type,
+                hit_sound=hit_sound,
+                hit_sample=hit_sample,
+                line=line,
+            )
+        )
+        last_time = time_ms
+
+    if not hit_objects:
+        first_time = int(round(beats[0] * 1000))
+        line = f"256,192,{first_time},1,0,0:0:0:0:"
+        hit_objects.append(
+            HitObject(
+                x=256,
+                y=192,
+                time=first_time,
+                object_type=1,
+                hit_sound=0,
+                hit_sample="0:0:0:0:",
+                line=line,
+            )
+        )
+
+    return hit_objects
+
+
 @app.post("/analyze/bpm", response_model=BpmAnalysisResponse)
 async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
     suffix = Path(audio.filename or "track.mp3").suffix.lower()
@@ -209,9 +320,22 @@ async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
             temp_path = Path(handle.name)
 
         signal, sample_rate = librosa.load(temp_path.as_posix(), sr=None, mono=True)
-        tempo, beat_frames = librosa.beat.beat_track(y=signal, sr=sample_rate, units="frames")
+        onset_env = librosa.onset.onset_strength(y=signal, sr=sample_rate)
+        tempo, beat_frames = librosa.beat.beat_track(
+            onset_envelope=onset_env, sr=sample_rate, units="frames"
+        )
         beat_times = librosa.frames_to_time(beat_frames, sr=sample_rate).tolist()
         duration = librosa.get_duration(y=signal, sr=sample_rate)
+        centroids = librosa.feature.spectral_centroid(y=signal, sr=sample_rate)[0]
+
+        beat_strengths: list[float] = []
+        beat_centroids: list[float] = []
+        for frame in beat_frames:
+            frame_index = int(frame)
+            strength = float(onset_env[frame_index]) if frame_index < len(onset_env) else 0.0
+            centroid = float(centroids[frame_index]) if frame_index < len(centroids) else 0.0
+            beat_strengths.append(strength)
+            beat_centroids.append(centroid)
 
         bpm_value = float(tempo[0] if hasattr(tempo, "__len__") else tempo)
         return BpmAnalysisResponse(
@@ -219,6 +343,8 @@ async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
             beats=[round(float(time), 4) for time in beat_times],
             beat_count=len(beat_times),
             duration_sec=round(float(duration), 4),
+            beat_strengths=[round(value, 6) for value in beat_strengths],
+            beat_centroids=[round(value, 4) for value in beat_centroids],
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"bpm analysis failed: {exc}") from exc
@@ -231,4 +357,10 @@ async def analyze_bpm(audio: UploadFile = File(...)) -> BpmAnalysisResponse:
 def generate_timing_points(payload: TimingPointRequest) -> TimingPointResponse:
     points = _generate_uninherited_points(payload)
     return TimingPointResponse(timing_points=points)
+
+
+@app.post("/generate/hit-objects", response_model=HitObjectResponse)
+def generate_hit_objects(payload: HitObjectRequest) -> HitObjectResponse:
+    hit_objects = _generate_hit_objects(payload)
+    return HitObjectResponse(hit_objects=hit_objects)
 
