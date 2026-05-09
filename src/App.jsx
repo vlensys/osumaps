@@ -44,6 +44,9 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState("");
   const [analysis, setAnalysis] = useState(null);
+  const [isGeneratingTiming, setIsGeneratingTiming] = useState(false);
+  const [timingError, setTimingError] = useState("");
+  const [timingPoints, setTimingPoints] = useState([]);
 
   useEffect(() => {
     return () => {
@@ -78,6 +81,8 @@ export default function App() {
     setDurationSec(0);
     setAnalysis(null);
     setAnalysisError("");
+    setTimingError("");
+    setTimingPoints([]);
     setMetadata((current) => ({
       ...current,
       title: nameMeta.title || current.title,
@@ -125,8 +130,44 @@ export default function App() {
     } catch (error) {
       setAnalysisError(error.message || "analysis failed");
       setAnalysis(null);
+      setTimingPoints([]);
     } finally {
       setIsAnalyzing(false);
+    }
+  };
+
+  const generateTimingPoints = async () => {
+    if (!analysis) return;
+    setIsGeneratingTiming(true);
+    setTimingError("");
+
+    try {
+      const response = await fetch(`${API_BASE}/generate/timing-points`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bpm: analysis.bpm,
+          beats: analysis.beats,
+          meter: 4,
+          sample_set: 1,
+          sample_index: 0,
+          volume: 70,
+          effects: 0
+        })
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        throw new Error(errorPayload?.detail || "timing point generation failed");
+      }
+
+      const payload = await response.json();
+      setTimingPoints(payload.timing_points ?? []);
+    } catch (error) {
+      setTimingError(error.message || "timing point generation failed");
+      setTimingPoints([]);
+    } finally {
+      setIsGeneratingTiming(false);
     }
   };
 
@@ -200,6 +241,23 @@ export default function App() {
                 <p>detected beats: {analysis.beat_count}</p>
                 <p>first beat at: {analysis.beats[0] ?? "n/a"} sec</p>
                 <p>beat length: {analysis.bpm > 0 ? (60000 / analysis.bpm).toFixed(2) : "n/a"} ms</p>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={generateTimingPoints}
+              disabled={!analysis || isGeneratingTiming}
+              className="mt-3 rounded-lg bg-amber-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isGeneratingTiming ? "generating timing points..." : "generate timing points"}
+            </button>
+            {timingError && <p className="mt-2 text-sm text-rose-300">{timingError}</p>}
+            {timingPoints.length > 0 && (
+              <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200">
+                <p className="mb-2 font-semibold text-slate-100">[timingpoints]</p>
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all">
+                  {timingPoints.map((point) => point.line).join("\n")}
+                </pre>
               </div>
             )}
           </article>

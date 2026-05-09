@@ -15,4 +15,5 @@ uvicorn main:app --reload
 
 - `GET /health`
 - `POST /analyze/bpm` with multipart form field `audio` (`.mp3` or `.flac`)
+- `POST /generate/timing-points` from detected BPM + beats
 

@@ -36,6 +36,7 @@ uvicorn main:app --reload
 1. audio upload (mp3/flac) with drag/drop
 2. local preview + basic metadata fields
 3. beat detection + bpm calculation via librosa endpoint (`POST /analyze/bpm`)
+4. timing point generation (`POST /generate/timing-points`)
 
-next: timing point generation (osu lazer format)
+next: note pattern generation from audio features
 
