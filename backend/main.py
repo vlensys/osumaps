@@ -150,7 +150,7 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
         "sv": 0.7,
         "spacing_mult": 35.0,
         "spacing_difficulty_mult": 0.4,
-        "threshold": 0.62,
+        "threshold": 0.48,
         "allowed_snaps": ("1/1", "1/2"),
     },
     "Normal": {
@@ -163,7 +163,7 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
         "sv": 0.9,
         "spacing_mult": 60.0,
         "spacing_difficulty_mult": 0.6,
-        "threshold": 0.52,
+        "threshold": 0.42,
         "allowed_snaps": ("1/1", "1/2", "1/4"),
     },
     "Hard": {
@@ -176,7 +176,7 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
         "sv": 1.3,
         "spacing_mult": 100.0,
         "spacing_difficulty_mult": 0.9,
-        "threshold": 0.45,
+        "threshold": 0.36,
         "allowed_snaps": ("1/1", "1/2", "1/4"),
     },
     "Insane": {
@@ -189,7 +189,7 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
         "sv": 1.6,
         "spacing_mult": 140.0,
         "spacing_difficulty_mult": 1.2,
-        "threshold": 0.36,
+        "threshold": 0.30,
         "allowed_snaps": ("1/2", "1/4", "1/6"),
     },
     "Expert": {
@@ -202,7 +202,7 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
         "sv": 1.9,
         "spacing_mult": 175.0,
         "spacing_difficulty_mult": 1.5,
-        "threshold": 0.30,
+        "threshold": 0.24,
         "allowed_snaps": ("1/2", "1/4", "1/6"),
     },
 }
@@ -373,20 +373,18 @@ def _analyze_audio_librosa(path: Path) -> dict[str, object]:
     if y.size == 0:
         raise ValueError("decoded audio has no samples")
 
-    onset_times = librosa.onset.onset_detect(
-        y=y,
-        sr=sr,
-        hop_length=hop_length,
-        units="time",
-        delta=0.07,
-        wait=10,
-    )
     spectral_flux = librosa.onset.onset_strength(
         y=y,
         sr=sr,
         hop_length=hop_length,
         n_fft=n_fft,
     ).astype(np.float32, copy=False)
+    onset_times = _detect_dense_onsets(
+        onset_envelope=spectral_flux,
+        sr=sr,
+        hop_length=hop_length,
+        duration_sec=float(librosa.get_duration(y=y, sr=sr)),
+    )
     rms = librosa.feature.rms(
         y=y,
         frame_length=n_fft,
@@ -493,6 +491,104 @@ def _compute_band_energies(
     return bass_energy, mid_energy, high_energy
 
 
+def _merge_onset_frames(frames: np.ndarray, min_gap_frames: int) -> np.ndarray:
+    if frames.size == 0:
+        return frames
+    merged: list[int] = [int(frames[0])]
+    for value in frames[1:]:
+        frame = int(value)
+        if frame - merged[-1] >= min_gap_frames:
+            merged.append(frame)
+    return np.array(merged, dtype=np.int32)
+
+
+def _peak_pick_fallback(onset_envelope: np.ndarray, target_count: int, min_gap_frames: int) -> np.ndarray:
+    if onset_envelope.size < 3:
+        return np.array([], dtype=np.int32)
+
+    local_max_indices = np.where(
+        (onset_envelope[1:-1] > onset_envelope[:-2]) &
+        (onset_envelope[1:-1] >= onset_envelope[2:])
+    )[0] + 1
+    if local_max_indices.size == 0:
+        return np.array([], dtype=np.int32)
+
+    values = onset_envelope[local_max_indices]
+    min_value = float(np.percentile(values, 55))
+    candidate_indices = local_max_indices[values >= min_value]
+    if candidate_indices.size == 0:
+        candidate_indices = local_max_indices
+
+    sorted_candidates = sorted(
+        candidate_indices.tolist(),
+        key=lambda idx: float(onset_envelope[idx]),
+        reverse=True,
+    )
+
+    selected: list[int] = []
+    for idx in sorted_candidates:
+        if any(abs(idx - taken) < min_gap_frames for taken in selected):
+            continue
+        selected.append(int(idx))
+        if len(selected) >= target_count:
+            break
+
+    if not selected:
+        return np.array([], dtype=np.int32)
+    selected.sort()
+    return np.array(selected, dtype=np.int32)
+
+
+def _detect_dense_onsets(
+    onset_envelope: np.ndarray,
+    sr: int,
+    hop_length: int,
+    duration_sec: float,
+) -> np.ndarray:
+    wait_default = max(1, int(0.03 * sr // hop_length))
+
+    primary = librosa.onset.onset_detect(
+        onset_envelope=onset_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        units="frames",
+        delta=0.045,
+        wait=wait_default,
+    )
+
+    dense = librosa.onset.onset_detect(
+        onset_envelope=onset_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        units="frames",
+        pre_avg=max(1, int(0.04 * sr // hop_length)),
+        post_avg=max(1, int(0.04 * sr // hop_length)),
+        wait=max(1, int(0.015 * sr // hop_length)),
+        delta=0.018,
+    )
+
+    merged = np.unique(np.concatenate([primary.astype(np.int32), dense.astype(np.int32)]))
+    merged.sort()
+
+    min_gap_frames = max(1, int(0.045 * sr // hop_length))
+    merged = _merge_onset_frames(merged, min_gap_frames=min_gap_frames)
+
+    min_target = int(max(48, duration_sec * 1.1))
+    if merged.size < min_target:
+        fallback = _peak_pick_fallback(
+            onset_envelope=onset_envelope,
+            target_count=min_target - int(merged.size),
+            min_gap_frames=min_gap_frames,
+        )
+        if fallback.size:
+            merged = np.unique(np.concatenate([merged, fallback]))
+            merged.sort()
+            merged = _merge_onset_frames(merged, min_gap_frames=min_gap_frames)
+
+    onset_times = librosa.frames_to_time(merged, sr=sr, hop_length=hop_length)
+    return onset_times.astype(np.float32, copy=False)
+
+
 def _sample_frame_feature(values: np.ndarray, onset_time: float, sr: int, hop: int = 512) -> float:
     frame = int(round((onset_time * sr) / hop))
     frame = max(0, min(frame, len(values) - 1))
@@ -577,9 +673,9 @@ def _generate_notes_for_profile(features: dict[str, object], profile: dict[str, 
 
     radius = (54.4 - 4.48 * cs) * 1.00041
     min_note_distance = max(20.0, min(90.0, radius * 0.9))
-    min_delta_ms = beat_ms * (0.52 - (od / 20.0))
-    min_delta_ms = float(np.clip(min_delta_ms, 55.0, beat_ms * 0.55))
-    threshold = float(np.clip(threshold + np.interp(hp, [2.0, 7.0], [0.04, -0.03]), 0.1, 0.92))
+    min_delta_ms = beat_ms * (0.34 - (od / 28.0))
+    min_delta_ms = float(np.clip(min_delta_ms, 26.0, beat_ms * 0.45))
+    threshold = float(np.clip(threshold + np.interp(hp, [2.0, 7.0], [0.0, -0.02]), 0.08, 0.9))
 
     notes: list[GeneratedNote] = []
     prev_time_ms: int | None = None
@@ -609,7 +705,7 @@ def _generate_notes_for_profile(features: dict[str, object], profile: dict[str, 
 
         time_ms = int(round(onset_time * 1000.0))
         delta_ms = beat_ms if prev_time_ms is None else max(1.0, time_ms - prev_time_ms)
-        if prev_time_ms is not None and delta_ms < min_delta_ms and intensity < min(0.98, threshold + 0.1):
+        if prev_time_ms is not None and delta_ms < min_delta_ms and intensity < min(0.98, threshold + 0.03):
             continue
 
         distance = (delta_ms / beat_ms) * spacing_mult
@@ -675,8 +771,14 @@ def _calibrate_profile_to_target(
     profile = dict(base_profile)
     notes: list[GeneratedNote] = []
     sr_est = 0.0
+    duration = max(1.0, float(features["duration"]))
+    target_note_floor = int(max(60, duration * (0.9 + float(profile["star_min"]) * 0.35)))
     for _ in range(8):
         notes, sr_est = _generate_notes_for_profile(features, profile)
+        if len(notes) < target_note_floor:
+            profile["threshold"] = max(0.06, float(profile["threshold"]) - 0.05)
+            profile["spacing_mult"] = float(profile["spacing_mult"]) * 1.04
+            continue
         if sr_est > float(profile["star_max"]) + 0.5:
             profile["threshold"] = min(0.92, float(profile["threshold"]) + 0.04)
             profile["spacing_mult"] = float(profile["spacing_mult"]) * 0.92
