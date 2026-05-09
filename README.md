@@ -28,6 +28,7 @@ audio to osu! lazer map converter.
 - `difficulty stars`:
   - primary difficulty control (`1.0★` to `10.0★`).
   - affects jump spacing, movement intensity, overlap avoidance strictness, and exported difficulty values (`hp/cs/od/ar`).
+  - this is a generator target value, not lazer's exact computed star rating.
 - `meter`:
   - beats per measure used in `[TimingPoints]`.
   - common values: `4` (most songs), `3` (waltz feel).
@@ -54,6 +55,7 @@ placement behavior:
 - generator uses both `x` and `y` axes.
 - spacing follows time-distance equality: shorter rhythms -> shorter spacing, stronger accents -> larger jumps.
 - notes are kept within playfield bounds and avoid near-overlap based on circle size.
+- rhythm follows detected onset peaks (musical transients), not only fixed metronome BPM ticks.
 
 ## troubleshooting
 

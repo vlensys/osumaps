@@ -258,13 +258,59 @@ async function analyzeAudioClientSide(file) {
 
     const bpm = (60 * framesPerSecond) / bestLag;
     const beatStepSec = 60 / Math.max(1, bpm);
-    const searchFrames = Math.min(frameCount, Math.round(framesPerSecond * 8));
-    const firstBeatFrame = findMaxIndex(onsetSmoothed, searchFrames);
+
+    // Peak-pick onset candidates (local max + local mean threshold + minimum distance).
+    // This follows standard onset peak-picking heuristics used in MIR literature.
+    const preMax = 2;
+    const postMax = 2;
+    const preAvg = 8;
+    const postAvg = 4;
+    const waitFrames = Math.max(2, Math.round(framesPerSecond * Math.max(0.06, beatStepSec * 0.28)));
+    const meanOnset = onsetSmoothed.reduce((a, b) => a + b, 0) / Math.max(1, onsetSmoothed.length);
+    const varianceOnset =
+      onsetSmoothed.reduce((a, b) => a + (b - meanOnset) * (b - meanOnset), 0) /
+      Math.max(1, onsetSmoothed.length);
+    const stdOnset = Math.sqrt(varianceOnset);
+    const delta = stdOnset * 0.35;
+
+    const peakFrames = [];
+    let previousPeak = -waitFrames;
+    for (let n = 1; n < onsetSmoothed.length - 1; n += 1) {
+      const maxStart = Math.max(0, n - preMax);
+      const maxEnd = Math.min(onsetSmoothed.length, n + postMax + 1);
+      let localMax = Number.NEGATIVE_INFINITY;
+      for (let i = maxStart; i < maxEnd; i += 1) localMax = Math.max(localMax, onsetSmoothed[i]);
+
+      const avgStart = Math.max(0, n - preAvg);
+      const avgEnd = Math.min(onsetSmoothed.length, n + postAvg + 1);
+      let localSum = 0;
+      for (let i = avgStart; i < avgEnd; i += 1) localSum += onsetSmoothed[i];
+      const localMean = localSum / Math.max(1, avgEnd - avgStart);
+
+      const isPeak = onsetSmoothed[n] === localMax && onsetSmoothed[n] >= localMean + delta;
+      const respectsWait = n - previousPeak > waitFrames;
+
+      if (isPeak && respectsWait) {
+        peakFrames.push(n);
+        previousPeak = n;
+      }
+    }
+
+    const timingSearchFrames = Math.min(frameCount, Math.round(framesPerSecond * 8));
+    const firstBeatFrame = findMaxIndex(onsetSmoothed, timingSearchFrames);
     const firstBeatSec = (firstBeatFrame * hopSize) / sampleRate;
 
-    const beats = [];
-    for (let t = firstBeatSec; t < durationSec; t += beatStepSec) beats.push(t);
-    for (let t = firstBeatSec - beatStepSec; t > 0; t -= beatStepSec) beats.unshift(t);
+    // Stable timing grid for [TimingPoints].
+    const timingBeats = [];
+    for (let t = firstBeatSec; t < durationSec; t += beatStepSec) timingBeats.push(t);
+    for (let t = firstBeatSec - beatStepSec; t > 0; t -= beatStepSec) timingBeats.unshift(t);
+
+    // Note candidates follow detected onsets, not pure BPM grid.
+    let beats = peakFrames.map((frame) => (frame * hopSize) / sampleRate);
+    if (beats.length < 8) {
+      // Fallback for very flat audio where onset peaks are weak.
+      beats = [...timingBeats];
+    }
 
     const beatStrengths = beats.map((beatSec) => {
       const frame = Math.min(frameCount - 1, Math.max(0, Math.round((beatSec * sampleRate) / hopSize)));
@@ -280,6 +326,7 @@ async function analyzeAudioClientSide(file) {
       bpm: Number(bpm.toFixed(3)),
       beats: beats.map((value) => Number(value.toFixed(4))),
       beat_count: beats.length,
+      timing_beats: timingBeats.map((value) => Number(value.toFixed(4))),
       duration_sec: Number(durationSec.toFixed(4)),
       beat_strengths: beatStrengths.map((value) => Number(value.toFixed(6))),
       beat_centroids: beatCentroids.map((value) => Number(value.toFixed(6)))
@@ -587,7 +634,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           bpm: analysisPayload.bpm,
-          beats: analysisPayload.beats,
+          beats: analysisPayload.timing_beats ?? analysisPayload.beats,
           meter: mapSettings.meter,
           sample_set: mapSettings.sampleSet,
           sample_index: mapSettings.sampleIndex,
@@ -948,6 +995,9 @@ export default function App() {
                   onChange={(event) => setSetting("starRating", Number(event.target.value))}
                   className="w-full accent-cyan-300"
                 />
+                <span className="mt-1 block text-xs text-slate-400">
+                  target generator intensity, not exact lazer star calculation
+                </span>
               </label>
               <label>
                 <span className="mb-1 block">meter</span>

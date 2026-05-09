@@ -258,9 +258,9 @@ def _generate_hit_objects(payload: HitObjectRequest) -> list[HitObject]:
     min_x, max_x = margin, 512 - margin
     min_y, max_y = margin, 384 - margin
 
-    base_min_jump = 16.0 + 4.5 * star
-    base_max_jump = 54.0 + 13.0 * star
-    min_note_distance = max(radius * 0.95, 20.0 + 1.5 * star)
+    base_min_jump = 24.0 + 5.2 * star
+    base_max_jump = 72.0 + 15.0 * star
+    min_note_distance = max(radius * 1.2, 24.0 + 2.4 * star)
 
     intervals = []
     for i in range(len(beats) - 1):
