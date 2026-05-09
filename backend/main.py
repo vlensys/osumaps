@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import time
+import traceback
 from pathlib import Path
 from statistics import median
 
 import librosa
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -21,6 +23,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_log_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    path = request.url.path
+    method = request.method
+    try:
+        response = await call_next(request)
+        elapsed = int((time.perf_counter() - started) * 1000)
+        print(f"[http] {method} {path} -> {response.status_code} ({elapsed}ms)", flush=True)
+        return response
+    except Exception:
+        elapsed = int((time.perf_counter() - started) * 1000)
+        print(f"[http] {method} {path} -> unhandled exception ({elapsed}ms)", flush=True)
+        print(traceback.format_exc(), flush=True)
+        raise
 
 
 class BpmAnalysisResponse(BaseModel):
@@ -193,6 +212,11 @@ DIFF_PROFILES: dict[str, dict[str, float | tuple[str, ...]]] = {
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"status": "ok", "service": "osumaps backend"}
 
 
 def _format_timing_line(
@@ -822,16 +846,21 @@ async def generate_full_map(
 ) -> FullGenerationResponse:
     temp_path, _ = _extract_audio_to_temp(audio)
     try:
+        print("[full-map] request received", flush=True)
         payload = await audio.read()
         if not payload:
             raise HTTPException(status_code=400, detail="empty file")
+        print(f"[full-map] upload bytes={len(payload)}", flush=True)
         temp_path.write_bytes(payload)
+        print("[full-map] temp file written", flush=True)
 
         features = _analyze_audio_librosa(temp_path)
+        print("[full-map] audio analysis complete", flush=True)
         star_target = min(max(float(difficulty_star), 1.0), 7.0)
         label, base_profile = _resolve_profile(difficulty_label, star_target)
 
         notes, sr_est, tuned_profile = _calibrate_profile_to_target(features, base_profile)
+        print(f"[full-map] note generation complete notes={len(notes)} est_sr={sr_est:.2f}", flush=True)
         notes = _thin_notes(notes, max(50, min(max_notes, 4000)))
         hit_objects = _build_hit_objects(notes, features, tuned_profile)
         timing_points = _build_timing_from_features(
@@ -879,6 +908,8 @@ async def generate_full_map(
     except HTTPException:
         raise
     except Exception as exc:
+        print(f"[full-map] failed: {exc}", flush=True)
+        print(traceback.format_exc(), flush=True)
         raise HTTPException(status_code=500, detail=f"full map generation failed: {exc}") from exc
     finally:
         temp_path.unlink(missing_ok=True)
