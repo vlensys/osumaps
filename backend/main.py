@@ -495,6 +495,7 @@ def _analyze_bpm_lightweight(path: Path) -> dict[str, object]:
     sr_target = 12000
     hop_length = 512
     n_fft = 1024
+    analyze_duration_sec = 32.0
 
     print("[analyze-bpm-light] loading audio", flush=True)
     y, sr = librosa.load(
@@ -502,7 +503,7 @@ def _analyze_bpm_lightweight(path: Path) -> dict[str, object]:
         sr=sr_target,
         mono=True,
         dtype=np.float32,
-        duration=120.0,
+        duration=analyze_duration_sec,
     )
     if y.size == 0:
         raise ValueError("decoded audio has no samples")
@@ -527,14 +528,7 @@ def _analyze_bpm_lightweight(path: Path) -> dict[str, object]:
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
 
     print("[analyze-bpm-light] tempo", flush=True)
-    tempo_candidates = librosa.feature.tempo(
-        onset_envelope=onset_env,
-        sr=sr,
-        hop_length=hop_length,
-        aggregate=np.median,
-    )
-    tempo_value = float(tempo_candidates[0]) if len(tempo_candidates) else 120.0
-    tempo_value = max(1.0, tempo_value)
+    tempo_value = _estimate_tempo_from_onset(onset_env, sr=sr, hop_length=hop_length)
 
     beat_strengths = [float(onset_env[min(max(int(f), 0), len(onset_env) - 1)]) for f in onset_frames]
     if not beat_strengths:
@@ -657,6 +651,36 @@ def _detect_dense_onsets(
 
     onset_times = librosa.frames_to_time(merged, sr=sr, hop_length=hop_length)
     return onset_times.astype(np.float32, copy=False)
+
+
+def _estimate_tempo_from_onset(onset_envelope: np.ndarray, sr: int, hop_length: int) -> float:
+    if onset_envelope.size < 8:
+        return 120.0
+
+    onset = onset_envelope.astype(np.float32, copy=False)
+    onset = onset - float(np.mean(onset))
+    if not np.any(np.isfinite(onset)):
+        return 120.0
+
+    min_bpm = 60.0
+    max_bpm = 210.0
+    fps = sr / hop_length
+    min_lag = max(1, int(round((60.0 * fps) / max_bpm)))
+    max_lag = max(min_lag + 1, int(round((60.0 * fps) / min_bpm)))
+    max_lag = min(max_lag, onset.size - 1)
+    if max_lag <= min_lag:
+        return 120.0
+
+    best_lag = min_lag
+    best_score = -1e30
+    for lag in range(min_lag, max_lag + 1):
+        score = float(np.dot(onset[:-lag], onset[lag:]))
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+
+    tempo = (60.0 * fps) / max(best_lag, 1)
+    return float(np.clip(tempo, min_bpm, max_bpm))
 
 
 def _sample_frame_feature(values: np.ndarray, onset_time: float, sr: int, hop: int = 512) -> float:
